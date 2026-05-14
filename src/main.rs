@@ -1,11 +1,24 @@
 use anyhow::{bail, Context, Result};
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use csv::{ReaderBuilder, StringRecord};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 use turso::{params_from_iter, Builder, Value};
 
 const BINANCE_COLS: usize = 12;
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum ImportMode {
+    /// Maximum crash safety. Slower.
+    Safe,
+
+    /// Good import speed with reasonable durability. Recommended default.
+    Balanced,
+
+    /// Fastest import mode. Delete and rebuild the DB if the machine crashes.
+    Unsafe,
+}
 
 #[derive(Parser, Debug)]
 #[command(author, version, about)]
@@ -31,8 +44,12 @@ struct Args {
     table: String,
 
     /// Commit every N rows
-    #[arg(short, long, default_value_t = 50_000)]
+    #[arg(short, long, default_value_t = 250_000)]
     batch_size: usize,
+
+    /// Print progress every N rows
+    #[arg(long, default_value_t = 1_000_000)]
+    progress_every: usize,
 
     /// CSV has a header row
     #[arg(long, default_value_t = false)]
@@ -42,9 +59,21 @@ struct Args {
     #[arg(long, default_value_t = false)]
     recreate: bool,
 
-    /// Use faster but less crash-safe import PRAGMAs
+    /// Import durability/speed mode
+    #[arg(long, value_enum, default_value = "balanced")]
+    import_mode: ImportMode,
+
+    /// Replace existing rows instead of skipping duplicates. Use only when recomputing columns.
     #[arg(long, default_value_t = false)]
-    unsafe_fast_import: bool,
+    replace_existing: bool,
+
+    /// Use a normal rowid table instead of WITHOUT ROWID
+    #[arg(long, default_value_t = false)]
+    rowid_table: bool,
+
+    /// Do not fail if CSV open_time values are not strictly increasing
+    #[arg(long, default_value_t = false)]
+    skip_order_check: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -54,10 +83,16 @@ struct CsvFile {
     month: u32,
 }
 
+struct ParsedRow {
+    open_time: i64,
+    values: Vec<Value>,
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
 
+    validate_args(&args)?;
     validate_ident(&args.table)?;
 
     let mut files = find_files(&args.dir, &args.symbol, &args.interval)?;
@@ -72,27 +107,35 @@ async fn main() -> Result<()> {
         );
     }
 
+    warn_missing_months(&files);
+
     let rsi_count = infer_max_rsi_columns(&files, args.has_header)?;
     println!("Found {} file(s). Max RSI columns: {}", files.len(), rsi_count);
+    println!(
+        "Import mode: {:?}. Batch size: {}. Conflict mode: {}.",
+        args.import_mode,
+        args.batch_size,
+        if args.replace_existing { "REPLACE" } else { "IGNORE" }
+    );
 
     let db = Builder::new_local(&args.db).build().await?;
     let conn = db.connect()?;
 
-    if args.unsafe_fast_import {
-        conn.execute("PRAGMA synchronous = OFF", ()).await?;
-        conn.execute("PRAGMA journal_mode = WAL", ()).await?;
-    }
+    apply_import_mode(&conn, args.import_mode).await?;
 
     if args.recreate {
-        conn.execute(&format!("DROP TABLE IF EXISTS {}", args.table), ()).await?;
+        conn.execute(&format!("DROP TABLE IF EXISTS {}", args.table), ())
+            .await?;
     }
 
-    create_table(&conn, &args.table, rsi_count).await?;
+    create_table(&conn, &args.table, rsi_count, !args.rowid_table).await?;
 
-    let insert_sql = build_insert_sql(&args.table, rsi_count);
+    let insert_sql = build_insert_sql(&args.table, rsi_count, args.replace_existing);
     let mut stmt = conn.prepare(&insert_sql).await?;
 
+    let start = Instant::now();
     let mut total_rows = 0usize;
+    let mut last_open_time: Option<i64> = None;
 
     conn.execute("BEGIN", ()).await?;
 
@@ -104,11 +147,13 @@ async fn main() -> Result<()> {
             &mut stmt,
             &conn,
             &mut total_rows,
+            &mut last_open_time,
+            start,
         )
         .await?;
 
         println!(
-            "Imported {:>10} rows from {}",
+            "Imported {:>12} rows from {}",
             imported,
             file.path.file_name().unwrap().to_string_lossy()
         );
@@ -116,16 +161,43 @@ async fn main() -> Result<()> {
 
     conn.execute("COMMIT", ()).await?;
 
-    conn.execute(
-        &format!(
-            "CREATE INDEX IF NOT EXISTS idx_{table}_time ON {table}(open_time)",
-            table = args.table
-        ),
-        (),
-    )
-    .await?;
+    println!(
+        "Done. Imported {} rows into {} in {:.1}s",
+        total_rows,
+        args.db,
+        start.elapsed().as_secs_f64()
+    );
 
-    println!("Done. Imported {} rows into {}", total_rows, args.db);
+    Ok(())
+}
+
+fn validate_args(args: &Args) -> Result<()> {
+    if args.batch_size == 0 {
+        bail!("--batch-size must be greater than 0");
+    }
+
+    if args.progress_every == 0 {
+        bail!("--progress-every must be greater than 0");
+    }
+
+    Ok(())
+}
+
+async fn apply_import_mode(conn: &turso::Connection, mode: ImportMode) -> Result<()> {
+    match mode {
+        ImportMode::Safe => {
+            conn.execute("PRAGMA journal_mode = WAL", ()).await?;
+            conn.execute("PRAGMA synchronous = FULL", ()).await?;
+        }
+        ImportMode::Balanced => {
+            conn.execute("PRAGMA journal_mode = WAL", ()).await?;
+            conn.execute("PRAGMA synchronous = NORMAL", ()).await?;
+        }
+        ImportMode::Unsafe => {
+            conn.execute("PRAGMA journal_mode = WAL", ()).await?;
+            conn.execute("PRAGMA synchronous = OFF", ()).await?;
+        }
+    }
 
     Ok(())
 }
@@ -181,6 +253,31 @@ fn parse_filename(file_name: &str) -> Option<(String, String, i32, u32)> {
     Some((symbol, interval, year, month))
 }
 
+fn warn_missing_months(files: &[CsvFile]) {
+    if files.len() < 2 {
+        return;
+    }
+
+    for pair in files.windows(2) {
+        let prev = &pair[0];
+        let next = &pair[1];
+        let mut expected_year = prev.year;
+        let mut expected_month = prev.month + 1;
+
+        if expected_month == 13 {
+            expected_month = 1;
+            expected_year += 1;
+        }
+
+        if next.year != expected_year || next.month != expected_month {
+            eprintln!(
+                "Warning: missing month(s) between {:04}-{:02} and {:04}-{:02}",
+                prev.year, prev.month, next.year, next.month
+            );
+        }
+    }
+}
+
 fn infer_max_rsi_columns(files: &[CsvFile], has_header: bool) -> Result<usize> {
     let mut max_rsi = 0usize;
 
@@ -189,9 +286,9 @@ fn infer_max_rsi_columns(files: &[CsvFile], has_header: bool) -> Result<usize> {
             .has_headers(has_header)
             .from_path(&file.path)?;
 
-        for result in reader.records() {
-            let record = result?;
+        let mut record = StringRecord::new();
 
+        while reader.read_record(&mut record)? {
             if record.is_empty() {
                 continue;
             }
@@ -213,7 +310,12 @@ fn infer_max_rsi_columns(files: &[CsvFile], has_header: bool) -> Result<usize> {
     Ok(max_rsi)
 }
 
-async fn create_table(conn: &turso::Connection, table: &str, rsi_count: usize) -> Result<()> {
+async fn create_table(
+    conn: &turso::Connection,
+    table: &str,
+    rsi_count: usize,
+    without_rowid: bool,
+) -> Result<()> {
     let mut cols = vec![
         "symbol TEXT NOT NULL".to_string(),
         "interval TEXT NOT NULL".to_string(),
@@ -239,17 +341,19 @@ async fn create_table(conn: &turso::Connection, table: &str, rsi_count: usize) -
 
     cols.push("PRIMARY KEY (symbol, interval, open_time)".to_string());
 
+    let suffix = if without_rowid { " WITHOUT ROWID" } else { "" };
     let sql = format!(
-        "CREATE TABLE IF NOT EXISTS {} ({})",
+        "CREATE TABLE IF NOT EXISTS {} ({}){}",
         table,
-        cols.join(", ")
+        cols.join(", "),
+        suffix
     );
 
     conn.execute(&sql, ()).await?;
     Ok(())
 }
 
-fn build_insert_sql(table: &str, rsi_count: usize) -> String {
+fn build_insert_sql(table: &str, rsi_count: usize, replace_existing: bool) -> String {
     let mut cols = vec![
         "symbol",
         "interval",
@@ -280,8 +384,11 @@ fn build_insert_sql(table: &str, rsi_count: usize) -> String {
         .map(|i| format!("?{}", i))
         .collect::<Vec<_>>();
 
+    let conflict_action = if replace_existing { "REPLACE" } else { "IGNORE" };
+
     format!(
-        "INSERT OR REPLACE INTO {} ({}) VALUES ({})",
+        "INSERT OR {} INTO {} ({}) VALUES ({})",
+        conflict_action,
         table,
         cols.join(", "),
         placeholders.join(", ")
@@ -295,22 +402,23 @@ async fn import_file(
     stmt: &mut turso::Statement,
     conn: &turso::Connection,
     total_rows: &mut usize,
+    last_open_time: &mut Option<i64>,
+    start: Instant,
 ) -> Result<usize> {
     let mut reader = ReaderBuilder::new()
         .has_headers(args.has_header)
         .from_path(&file.path)
         .with_context(|| format!("Cannot open {}", file.path.display()))?;
 
+    let mut record = StringRecord::new();
     let mut file_rows = 0usize;
 
-    for result in reader.records() {
-        let record = result?;
-
+    while reader.read_record(&mut record)? {
         if record.is_empty() {
             continue;
         }
 
-        let params = record_to_params(
+        let row = record_to_row(
             &record,
             &args.symbol,
             &args.interval,
@@ -320,34 +428,64 @@ async fn import_file(
         )
         .with_context(|| format!("Bad row in {}", file.path.display()))?;
 
-        stmt.execute(params_from_iter(params)).await?;
+        if !args.skip_order_check {
+            if let Some(prev_open_time) = *last_open_time {
+                if row.open_time <= prev_open_time {
+                    bail!(
+                        "open_time is not strictly increasing: previous={}, current={} in {}",
+                        prev_open_time,
+                        row.open_time,
+                        file.path.display()
+                    );
+                }
+            }
+        }
+
+        stmt.execute(params_from_iter(row.values)).await?;
         stmt.reset()?;
 
+        *last_open_time = Some(row.open_time);
         file_rows += 1;
         *total_rows += 1;
 
         if *total_rows % args.batch_size == 0 {
             conn.execute("COMMIT", ()).await?;
             conn.execute("BEGIN", ()).await?;
-            println!("Committed {} rows...", total_rows);
+        }
+
+        if *total_rows % args.progress_every == 0 {
+            let elapsed = start.elapsed().as_secs_f64();
+            let rows_per_sec = *total_rows as f64 / elapsed.max(0.001);
+
+            println!(
+                "Progress: {:>12} rows | {:>10.0} rows/s | {:.1}s elapsed",
+                *total_rows,
+                rows_per_sec,
+                elapsed
+            );
         }
     }
 
     Ok(file_rows)
 }
 
-fn record_to_params(
+fn record_to_row(
     record: &StringRecord,
     symbol: &str,
     interval: &str,
     year: i32,
     month: u32,
     rsi_count: usize,
-) -> Result<Vec<Value>> {
+) -> Result<ParsedRow> {
     if record.len() < BINANCE_COLS {
-        bail!("row has {} columns, expected at least {}", record.len(), BINANCE_COLS);
+        bail!(
+            "row has {} columns, expected at least {}",
+            record.len(),
+            BINANCE_COLS
+        );
     }
 
+    let open_time = parse_i64(record, 0, "open_time")?;
     let mut values = Vec::with_capacity(16 + rsi_count);
 
     values.push(Value::from(symbol.to_string()));
@@ -355,7 +493,7 @@ fn record_to_params(
     values.push(Value::from(year as i64));
     values.push(Value::from(month as i64));
 
-    values.push(Value::from(parse_i64(record, 0, "open_time")?));
+    values.push(Value::from(open_time));
     values.push(Value::from(parse_f64(record, 1, "open")?));
     values.push(Value::from(parse_f64(record, 2, "high")?));
     values.push(Value::from(parse_f64(record, 3, "low")?));
@@ -379,7 +517,7 @@ fn record_to_params(
         values.push(value);
     }
 
-    Ok(values)
+    Ok(ParsedRow { open_time, values })
 }
 
 fn parse_i64(record: &StringRecord, idx: usize, name: &str) -> Result<i64> {
@@ -405,13 +543,9 @@ fn validate_ident(name: &str) -> Result<()> {
         bail!("SQL identifier cannot be empty");
     }
 
-    if !name
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || c == '_')
-    {
+    if !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
         bail!("Unsafe SQL identifier: {}", name);
     }
 
     Ok(())
 }
-
