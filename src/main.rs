@@ -1,10 +1,10 @@
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use clap::{Parser, ValueEnum};
 use csv::{ReaderBuilder, StringRecord};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
-use turso::{params_from_iter, Builder, Value};
+use turso::{Builder, Value, params_from_iter};
 
 const BINANCE_COLS: usize = 12;
 
@@ -21,7 +21,13 @@ enum ImportMode {
 }
 
 #[derive(Parser, Debug)]
-#[command(author, version, about)]
+#[command(
+    about = "Import Binance Vision CSV files into a local Turso database",
+    long_about = "Import Binance Vision CSV files into a local Turso database.\n\nBy default this reads matching files like SOLUSDT-1s-2026-04.csv from the current directory, creates market_data.turso, and imports rows into candles_1s. Files are processed in year-month order. Existing rows are skipped by default so interrupted imports can be resumed safely. Use --recreate to drop and rebuild the table, --replace-existing to overwrite duplicate primary keys, and --import-mode unsafe only when you are willing to delete and rebuild the database after a crash.",
+    version,
+    disable_version_flag = true,
+    after_help = "Examples:\n  csv-to-turso -d ../data\n  csv-to-turso -d ../data -o sol.turso --recreate\n  csv-to-turso -d ../data --import-mode unsafe --batch-size 500000\n  csv-to-turso -d ../data --has-header --replace-existing\n  csv-to-turso -d ../data --symbol BTCUSDT --interval 1m --table candles_1m\n\nVerification:\n  turso dev --db-file market_data.turso\n  SELECT COUNT(*) FROM candles_1s;\n  SELECT MIN(open_time), MAX(open_time) FROM candles_1s;\n\nNotes:\n  Defaults: --dir ., --db market_data.turso, --symbol SOLUSDT, --interval 1s, --table candles_1s.\n  Defaults: --batch-size 250000, --progress-every 1000000, --import-mode balanced.\n  For 120M-row imports, use --import-mode balanced first; use unsafe only if rebuilding after a crash is acceptable.\n  --replace-existing rewrites duplicate primary keys; without it duplicates are ignored.\n  --rowid-table disables WITHOUT ROWID and usually makes this table larger.\n  --skip-order-check allows non-increasing open_time values, but only use it when the files are intentionally unordered."
+)]
 struct Args {
     /// Directory containing files like SOLUSDT-1s-2026-04.csv
     #[arg(short, long, default_value = ".")]
@@ -74,6 +80,10 @@ struct Args {
     /// Do not fail if CSV open_time values are not strictly increasing
     #[arg(long, default_value_t = false)]
     skip_order_check: bool,
+
+    /// Print version information and exit.
+    #[arg(short = 'v', long = "version", action = clap::ArgAction::SetTrue, required = false)]
+    version_flag: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -90,7 +100,16 @@ struct ParsedRow {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    if std::env::args_os()
+        .skip(1)
+        .any(|arg| arg == "-v" || arg == "--version")
+    {
+        print_version();
+        return Ok(());
+    }
+
     let args = Args::parse();
+    let _ = args.version_flag;
 
     validate_args(&args)?;
     validate_ident(&args.table)?;
@@ -110,12 +129,20 @@ async fn main() -> Result<()> {
     warn_missing_months(&files);
 
     let rsi_count = infer_max_rsi_columns(&files, args.has_header)?;
-    println!("Found {} file(s). Max RSI columns: {}", files.len(), rsi_count);
+    println!(
+        "Found {} file(s). Max RSI columns: {}",
+        files.len(),
+        rsi_count
+    );
     println!(
         "Import mode: {:?}. Batch size: {}. Conflict mode: {}.",
         args.import_mode,
         args.batch_size,
-        if args.replace_existing { "REPLACE" } else { "IGNORE" }
+        if args.replace_existing {
+            "REPLACE"
+        } else {
+            "IGNORE"
+        }
     );
 
     let db = Builder::new_local(&args.db).build().await?;
@@ -169,6 +196,10 @@ async fn main() -> Result<()> {
     );
 
     Ok(())
+}
+
+fn print_version() {
+    println!("{} {}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
 }
 
 fn validate_args(args: &Args) -> Result<()> {
@@ -384,7 +415,11 @@ fn build_insert_sql(table: &str, rsi_count: usize, replace_existing: bool) -> St
         .map(|i| format!("?{}", i))
         .collect::<Vec<_>>();
 
-    let conflict_action = if replace_existing { "REPLACE" } else { "IGNORE" };
+    let conflict_action = if replace_existing {
+        "REPLACE"
+    } else {
+        "IGNORE"
+    };
 
     format!(
         "INSERT OR {} INTO {} ({}) VALUES ({})",
@@ -459,9 +494,7 @@ async fn import_file(
 
             println!(
                 "Progress: {:>12} rows | {:>10.0} rows/s | {:.1}s elapsed",
-                *total_rows,
-                rows_per_sec,
-                elapsed
+                *total_rows, rows_per_sec, elapsed
             );
         }
     }
@@ -502,8 +535,16 @@ fn record_to_row(
     values.push(Value::from(parse_i64(record, 6, "close_time")?));
     values.push(Value::from(parse_f64(record, 7, "quote_asset_volume")?));
     values.push(Value::from(parse_i64(record, 8, "number_of_trades")?));
-    values.push(Value::from(parse_f64(record, 9, "taker_buy_base_asset_volume")?));
-    values.push(Value::from(parse_f64(record, 10, "taker_buy_quote_asset_volume")?));
+    values.push(Value::from(parse_f64(
+        record,
+        9,
+        "taker_buy_base_asset_volume",
+    )?));
+    values.push(Value::from(parse_f64(
+        record,
+        10,
+        "taker_buy_quote_asset_volume",
+    )?));
     values.push(Value::from(record.get(11).unwrap_or("").to_string()));
 
     for i in 0..rsi_count {
@@ -549,3 +590,4 @@ fn validate_ident(name: &str) -> Result<()> {
 
     Ok(())
 }
+
