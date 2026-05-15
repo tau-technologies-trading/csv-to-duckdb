@@ -324,7 +324,6 @@ async fn main() -> Result<()> {
                 last_open_time = Some(file_last_open_time);
             }
 
-            create_monthly_view(&conn, &args, file).await?;
             progress.println(format!("Imported {:>12} rows from {}", 0, file_name));
             continue;
         }
@@ -343,12 +342,16 @@ async fn main() -> Result<()> {
         )
         .await?;
         progress_slot.finish();
-        create_monthly_view(&conn, &args, file).await?;
 
         progress.println(format!("Imported {:>12} rows from {}", imported, file_name));
     }
 
     conn.execute("COMMIT", ()).await?;
+
+    for file in files.iter() {
+        create_monthly_view(&conn, &args, file).await?;
+    }
+
     progress.finish();
 
     let elapsed = start.elapsed().as_secs_f64();
