@@ -33,10 +33,10 @@ enum RecreateAction {
 #[derive(Parser, Debug)]
 #[command(
     about = "Import Binance Vision CSV files into a local Turso database",
-    long_about = "Import Binance Vision CSV files into a local Turso database.\n\nBy default this reads matching files like SOLUSDT-1s-2026-04.csv from the current directory, creates market_data.turso, and imports rows into klines_1s. Files are processed in year-month order. Existing rows are skipped by default so interrupted imports can be resumed safely. Use --recreate to delete the DB file family and rebuild from scratch, --recreate-pragmatic to rebuild only this table unless it is the DB's only user table, --replace-existing to overwrite duplicate primary keys, and --import-mode unsafe only when you are willing to delete and rebuild the database after a crash.",
+    long_about = "Import Binance Vision CSV files into a local Turso database.\n\nBy default this reads matching files like SOLUSDT-1s-2026-04.csv from the current directory, creates market_data.turso, and imports rows into klines_1s. Files are processed in year-month order. Existing rows are skipped by default so interrupted imports can be resumed safely. Use --auto N to import only the newest N matching CSV files, --recreate to delete the DB file family and rebuild from scratch, --recreate-pragmatic to rebuild only this table unless it is the DB's only user table, --replace-existing to overwrite duplicate primary keys, and --import-mode unsafe only when you are willing to delete and rebuild the database after a crash.",
     version,
     disable_version_flag = true,
-    after_help = "Examples:\n  csv-to-turso -d ../data\n  csv-to-turso -d ../data -o sol.turso --recreate\n  csv-to-turso -d ../data -o sol.turso --recreate-pragmatic\n  csv-to-turso -d ../data --import-mode unsafe --batch-size 500000\n  csv-to-turso -d ../data --has-header --replace-existing\n  csv-to-turso -d ../data --symbol BTCUSDT --interval 1m --table klines_1m\n\nVerification:\n  tursodb --readonly market_data.turso 'SELECT COUNT(*) FROM klines_1s;'\n  tursodb --readonly market_data.turso 'SELECT MIN(open_time), MAX(open_time) FROM klines_1s;'\n\nNotes:\n  Defaults: --dir ., --db market_data.turso, --symbol SOLUSDT, --interval 1s, --table klines_1s.\n  Defaults: --batch-size 250000, --progress-every 1000000, --import-mode balanced.\n  Imports the 12 Binance Vision kline columns plus any extra generated RSI columns.\n  For 120M-row imports, use --import-mode balanced first; use unsafe only if rebuilding after a crash is acceptable.\n  --recreate deletes the DB, WAL, and SHM files before importing.\n  --recreate-pragmatic deletes the DB file family only when the requested table is the only user table; otherwise it drops that table, vacuums, and truncates WAL.\n  --replace-existing rewrites duplicate primary keys; without it duplicates are ignored.\n  --skip-order-check allows non-increasing open_time values, but only use it when the files are intentionally unordered."
+    after_help = "Examples:\n  csv-to-turso -d ../data\n  csv-to-turso -d ../data --auto 3\n  csv-to-turso -d ../data -o sol.turso --recreate\n  csv-to-turso -d ../data -o sol.turso --recreate-pragmatic\n  csv-to-turso -d ../data --import-mode unsafe --batch-size 500000\n  csv-to-turso -d ../data --has-header --replace-existing\n  csv-to-turso -d ../data --symbol BTCUSDT --interval 1m --table klines_1m\n\nVerification:\n  tursodb --readonly market_data.turso 'SELECT COUNT(*) FROM klines_1s;'\n  tursodb --readonly market_data.turso 'SELECT MIN(open_time), MAX(open_time) FROM klines_1s;'\n\nNotes:\n  Defaults: --dir ., --db market_data.turso, --symbol SOLUSDT, --interval 1s, --table klines_1s.\n  Defaults: --batch-size 250000, --progress-every 1000000, --import-mode balanced.\n  Imports the 12 Binance Vision kline columns plus any extra generated RSI columns.\n  --auto N imports only the newest N matching CSV files and cannot be combined with recreate options.\n  For 120M-row imports, use --import-mode balanced first; use unsafe only if rebuilding after a crash is acceptable.\n  --recreate deletes the DB, WAL, and SHM files before importing.\n  --recreate-pragmatic deletes the DB file family only when the requested table is the only user table; otherwise it drops that table, vacuums, and truncates WAL.\n  --replace-existing rewrites duplicate primary keys; without it duplicates are ignored.\n  --skip-order-check allows non-increasing open_time values, but only use it when the files are intentionally unordered."
 )]
 struct Args {
     /// Directory containing files like SOLUSDT-1s-2026-04.csv
@@ -90,6 +90,10 @@ struct Args {
     /// Do not fail if CSV open_time values are not strictly increasing
     #[arg(long, default_value_t = false)]
     skip_order_check: bool,
+
+    /// Import only the newest N matching CSV files
+    #[arg(long)]
+    auto: Option<usize>,
 
     /// Print version information and exit.
     #[arg(short = 'v', long = "version", action = clap::ArgAction::SetTrue, required = false)]
@@ -241,6 +245,7 @@ async fn main() -> Result<()> {
 
     let mut files = find_files(&args.dir, &args.symbol, &args.interval)?;
     files.sort_by_key(|f| (f.year, f.month));
+    apply_auto_file_limit(&mut files, args.auto);
 
     if files.is_empty() {
         bail!(
@@ -358,7 +363,25 @@ fn validate_args(args: &Args) -> Result<()> {
         bail!("--recreate and --recreate-pragmatic cannot be used together");
     }
 
+    if args.auto == Some(0) {
+        bail!("--auto must be greater than 0");
+    }
+
+    if args.auto.is_some() && (args.recreate || args.recreate_pragmatic) {
+        bail!("--auto cannot be combined with recreate options");
+    }
+
     Ok(())
+}
+
+fn apply_auto_file_limit(files: &mut Vec<CsvFile>, auto: Option<usize>) {
+    let Some(limit) = auto else {
+        return;
+    };
+
+    if files.len() > limit {
+        files.drain(..files.len() - limit);
+    }
 }
 
 async fn determine_recreate_action(args: &Args) -> Result<RecreateAction> {
