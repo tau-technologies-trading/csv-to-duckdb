@@ -285,16 +285,12 @@ async fn main() -> Result<()> {
         remove_database_files(&args.db)?;
     }
 
-    let db = Builder::new_local(&args.db)
-        .experimental_materialized_views(true)
-        .build()
-        .await?;
+    let db = Builder::new_local(&args.db).build().await?;
     let conn = db.connect()?;
 
     apply_import_mode(&conn, args.import_mode).await?;
 
     if recreate_action == RecreateAction::DropTableOnly {
-        drop_monthly_views(&conn, &args, &files).await?;
         conn.execute(&format!("DROP TABLE IF EXISTS {}", args.table), ())
             .await?;
         apply_wal_checkpoint_truncate(&conn).await?;
@@ -322,20 +318,6 @@ async fn main() -> Result<()> {
     for (file, stats) in files.iter().zip(file_stats.iter()) {
         let file_name = file.path.file_name().unwrap().to_string_lossy().to_string();
         let mut progress_slot = progress.acquire_slot(&file_name, Some(stats.row_count as u64));
-
-        if recreate_action == RecreateAction::None
-            && monthly_view_exists(&conn, &args, file).await?
-        {
-            progress_slot.inc(stats.row_count as u64);
-            progress_slot.finish();
-
-            if let Some(file_last_open_time) = stats.last_open_time {
-                last_open_time = Some(file_last_open_time);
-            }
-
-            progress.println(format!("Imported {:>12} rows from {}", 0, file_name));
-            continue;
-        }
 
         if should_skip_file(stats, resume_open_time) {
             progress_slot.inc(stats.row_count as u64);
@@ -368,10 +350,6 @@ async fn main() -> Result<()> {
     }
 
     conn.execute("COMMIT", ()).await?;
-
-    for file in files.iter() {
-        create_monthly_view(&conn, &args, file).await?;
-    }
 
     progress.finish();
 
@@ -427,10 +405,7 @@ async fn existing_user_tables(db_path: &str) -> Result<Vec<String>> {
         return Ok(Vec::new());
     }
 
-    let db = Builder::new_local(db_path)
-        .experimental_materialized_views(true)
-        .build()
-        .await?;
+    let db = Builder::new_local(db_path).build().await?;
     let conn = db.connect()?;
     let mut rows = conn
         .query(
@@ -655,88 +630,6 @@ fn should_skip_file(stats: &FileStats, resume_open_time: Option<i64>) -> bool {
         }
         _ => false,
     }
-}
-
-async fn drop_monthly_views(
-    conn: &turso::Connection,
-    args: &Args,
-    files: &[CsvFile],
-) -> Result<()> {
-    for file in files {
-        let view_name = monthly_view_name(&args.table, &args.symbol, &args.interval, file);
-        conn.execute(&format!("DROP VIEW IF EXISTS {}", view_name), ())
-            .await?;
-    }
-
-    Ok(())
-}
-
-async fn create_monthly_view(conn: &turso::Connection, args: &Args, file: &CsvFile) -> Result<()> {
-    let view_name = monthly_view_name(&args.table, &args.symbol, &args.interval, file);
-    validate_ident(&view_name)?;
-
-    let sql = format!(
-        "CREATE VIEW IF NOT EXISTS {} AS SELECT * FROM {} WHERE symbol = '{}' AND interval = '{}' AND year = {} AND month = {}",
-        view_name,
-        args.table,
-        sql_string_literal(&args.symbol),
-        sql_string_literal(&args.interval),
-        file.year,
-        file.month
-    );
-    conn.execute(&sql, ()).await?;
-
-    Ok(())
-}
-
-async fn monthly_view_exists(
-    conn: &turso::Connection,
-    args: &Args,
-    file: &CsvFile,
-) -> Result<bool> {
-    let view_name = monthly_view_name(&args.table, &args.symbol, &args.interval, file);
-    let mut rows = conn
-        .query(
-            "SELECT 1 FROM sqlite_master WHERE type = 'view' AND name = ?1",
-            (view_name,),
-        )
-        .await?;
-
-    Ok(rows.next().await?.is_some())
-}
-
-fn monthly_view_name(table: &str, symbol: &str, interval: &str, file: &CsvFile) -> String {
-    format!(
-        "{}_{}_{}_{:04}_{:02}",
-        table,
-        ident_fragment(symbol),
-        ident_fragment(interval),
-        file.year,
-        file.month
-    )
-}
-
-fn ident_fragment(value: &str) -> String {
-    let fragment = value
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() {
-                c.to_ascii_lowercase()
-            } else {
-                '_'
-            }
-        })
-        .collect::<String>();
-
-    if fragment.is_empty() {
-        return "value".to_string();
-    }
-
-    fragment
-}
-
-fn sql_string_literal(value: &str) -> String {
-    value.replace('\'', "''")
 }
 
 async fn max_open_time(
