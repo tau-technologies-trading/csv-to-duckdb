@@ -23,13 +23,20 @@ enum ImportMode {
     Unsafe,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RecreateAction {
+    None,
+    DeleteDatabaseFiles,
+    DropTableOnly,
+}
+
 #[derive(Parser, Debug)]
 #[command(
     about = "Import Binance Vision CSV files into a local Turso database",
-    long_about = "Import Binance Vision CSV files into a local Turso database.\n\nBy default this reads matching files like SOLUSDT-1s-2026-04.csv from the current directory, creates market_data.turso, and imports rows into klines_1s. Files are processed in year-month order. Existing rows are skipped by default so interrupted imports can be resumed safely. Use --recreate to drop and rebuild the table, --replace-existing to overwrite duplicate primary keys, and --import-mode unsafe only when you are willing to delete and rebuild the database after a crash.",
+    long_about = "Import Binance Vision CSV files into a local Turso database.\n\nBy default this reads matching files like SOLUSDT-1s-2026-04.csv from the current directory, creates market_data.turso, and imports rows into klines_1s. Files are processed in year-month order. Existing rows are skipped by default so interrupted imports can be resumed safely. Use --recreate to delete the DB file family and rebuild from scratch, --recreate-pragmatic to rebuild only this table unless it is the DB's only user table, --replace-existing to overwrite duplicate primary keys, and --import-mode unsafe only when you are willing to delete and rebuild the database after a crash.",
     version,
     disable_version_flag = true,
-    after_help = "Examples:\n  csv-to-turso -d ../data\n  csv-to-turso -d ../data -o sol.turso --recreate\n  csv-to-turso -d ../data --import-mode unsafe --batch-size 500000\n  csv-to-turso -d ../data --has-header --replace-existing\n  csv-to-turso -d ../data --symbol BTCUSDT --interval 1m --table klines_1m\n\nVerification:\n  tursodb --readonly market_data.turso 'SELECT COUNT(*) FROM klines_1s;'\n  tursodb --readonly market_data.turso 'SELECT MIN(open_time), MAX(open_time) FROM klines_1s;'\n\nNotes:\n  Defaults: --dir ., --db market_data.turso, --symbol SOLUSDT, --interval 1s, --table klines_1s.\n  Defaults: --batch-size 250000, --progress-every 1000000, --import-mode balanced.\n  Imports the 12 Binance Vision kline columns plus any extra generated RSI columns.\n  For 120M-row imports, use --import-mode balanced first; use unsafe only if rebuilding after a crash is acceptable.\n  --replace-existing rewrites duplicate primary keys; without it duplicates are ignored.\n  --skip-order-check allows non-increasing open_time values, but only use it when the files are intentionally unordered."
+    after_help = "Examples:\n  csv-to-turso -d ../data\n  csv-to-turso -d ../data -o sol.turso --recreate\n  csv-to-turso -d ../data -o sol.turso --recreate-pragmatic\n  csv-to-turso -d ../data --import-mode unsafe --batch-size 500000\n  csv-to-turso -d ../data --has-header --replace-existing\n  csv-to-turso -d ../data --symbol BTCUSDT --interval 1m --table klines_1m\n\nVerification:\n  tursodb --readonly market_data.turso 'SELECT COUNT(*) FROM klines_1s;'\n  tursodb --readonly market_data.turso 'SELECT MIN(open_time), MAX(open_time) FROM klines_1s;'\n\nNotes:\n  Defaults: --dir ., --db market_data.turso, --symbol SOLUSDT, --interval 1s, --table klines_1s.\n  Defaults: --batch-size 250000, --progress-every 1000000, --import-mode balanced.\n  Imports the 12 Binance Vision kline columns plus any extra generated RSI columns.\n  For 120M-row imports, use --import-mode balanced first; use unsafe only if rebuilding after a crash is acceptable.\n  --recreate deletes the DB, WAL, and SHM files before importing.\n  --recreate-pragmatic deletes the DB file family only when the requested table is the only user table; otherwise it drops that table, vacuums, and truncates WAL.\n  --replace-existing rewrites duplicate primary keys; without it duplicates are ignored.\n  --skip-order-check allows non-increasing open_time values, but only use it when the files are intentionally unordered."
 )]
 struct Args {
     /// Directory containing files like SOLUSDT-1s-2026-04.csv
@@ -64,9 +71,13 @@ struct Args {
     #[arg(long, default_value_t = false)]
     has_header: bool,
 
-    /// Drop and recreate the table before importing
+    /// Delete DB/WAL/SHM files and recreate from scratch before importing
     #[arg(long, default_value_t = false)]
     recreate: bool,
+
+    /// Recreate efficiently while preserving other user tables when present
+    #[arg(long, default_value_t = false)]
+    recreate_pragmatic: bool,
 
     /// Import durability/speed mode
     #[arg(long, value_enum, default_value = "balanced")]
@@ -269,6 +280,11 @@ async fn main() -> Result<()> {
         }
     );
 
+    let recreate_action = determine_recreate_action(&args).await?;
+    if recreate_action == RecreateAction::DeleteDatabaseFiles {
+        remove_database_files(&args.db)?;
+    }
+
     let db = Builder::new_local(&args.db)
         .experimental_materialized_views(true)
         .build()
@@ -277,10 +293,13 @@ async fn main() -> Result<()> {
 
     apply_import_mode(&conn, args.import_mode).await?;
 
-    if args.recreate {
+    if recreate_action == RecreateAction::DropTableOnly {
         drop_monthly_views(&conn, &args, &files).await?;
         conn.execute(&format!("DROP TABLE IF EXISTS {}", args.table), ())
             .await?;
+        apply_wal_checkpoint_truncate(&conn).await?;
+        conn.execute("VACUUM", ()).await?;
+        apply_wal_checkpoint_truncate(&conn).await?;
     }
 
     create_table(&conn, &args.table, rsi_count).await?;
@@ -304,7 +323,9 @@ async fn main() -> Result<()> {
         let file_name = file.path.file_name().unwrap().to_string_lossy().to_string();
         let mut progress_slot = progress.acquire_slot(&file_name, Some(stats.row_count as u64));
 
-        if !args.recreate && monthly_view_exists(&conn, &args, file).await? {
+        if recreate_action == RecreateAction::None
+            && monthly_view_exists(&conn, &args, file).await?
+        {
             progress_slot.inc(stats.row_count as u64);
             progress_slot.finish();
 
@@ -377,7 +398,78 @@ fn validate_args(args: &Args) -> Result<()> {
         bail!("--progress-every must be greater than 0");
     }
 
+    if args.recreate && args.recreate_pragmatic {
+        bail!("--recreate and --recreate-pragmatic cannot be used together");
+    }
+
     Ok(())
+}
+
+async fn determine_recreate_action(args: &Args) -> Result<RecreateAction> {
+    if args.recreate {
+        return Ok(RecreateAction::DeleteDatabaseFiles);
+    }
+
+    if !args.recreate_pragmatic {
+        return Ok(RecreateAction::None);
+    }
+
+    let table_names = existing_user_tables(&args.db).await?;
+    if table_names.is_empty() || (table_names.len() == 1 && table_names[0] == args.table) {
+        return Ok(RecreateAction::DeleteDatabaseFiles);
+    }
+
+    Ok(RecreateAction::DropTableOnly)
+}
+
+async fn existing_user_tables(db_path: &str) -> Result<Vec<String>> {
+    if !Path::new(db_path).exists() {
+        return Ok(Vec::new());
+    }
+
+    let db = Builder::new_local(db_path)
+        .experimental_materialized_views(true)
+        .build()
+        .await?;
+    let conn = db.connect()?;
+    let mut rows = conn
+        .query(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name",
+            (),
+        )
+        .await?;
+
+    let mut table_names = Vec::new();
+    while let Some(row) = rows.next().await? {
+        match row.get_value(0)? {
+            Value::Text(table_name) => table_names.push(table_name),
+            other => bail!("Unexpected sqlite_master table name value: {:?}", other),
+        }
+    }
+
+    Ok(table_names)
+}
+
+fn remove_database_files(db_path: &str) -> Result<()> {
+    for path in database_file_family(db_path) {
+        match fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => {
+                return Err(err).with_context(|| format!("Cannot remove {}", path.display()));
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn database_file_family(db_path: &str) -> [PathBuf; 3] {
+    [
+        PathBuf::from(db_path),
+        PathBuf::from(format!("{}-wal", db_path)),
+        PathBuf::from(format!("{}-shm", db_path)),
+    ]
 }
 
 async fn apply_import_mode(conn: &turso::Connection, mode: ImportMode) -> Result<()> {
@@ -400,6 +492,12 @@ async fn apply_import_mode(conn: &turso::Connection, mode: ImportMode) -> Result
 
 async fn apply_journal_mode(conn: &turso::Connection) -> Result<()> {
     let mut rows = conn.query("PRAGMA journal_mode = WAL", ()).await?;
+    while rows.next().await?.is_some() {}
+    Ok(())
+}
+
+async fn apply_wal_checkpoint_truncate(conn: &turso::Connection) -> Result<()> {
+    let mut rows = conn.query("PRAGMA wal_checkpoint(TRUNCATE)", ()).await?;
     while rows.next().await?.is_some() {}
     Ok(())
 }

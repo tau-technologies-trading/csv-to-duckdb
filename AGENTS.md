@@ -3,7 +3,7 @@
 ## Project Overview
 
 - **Name**: csv-to-turso
-- **Version**: 0.3.0
+- **Version**: 0.3.2
 - **Language**: Rust (edition 2024)
 - **Purpose**: Import Binance Vision CSV files into a local Turso (libSQL) database
 - **Repository**: `/home/nikolai/Coding/Quant/csv-to-turso`
@@ -51,7 +51,8 @@ cargo run --release -- \
 | `-b, --batch-size` | `250000` | Rows per transaction commit |
 | `--progress-every` | `1000000` | Print progress every N rows |
 | `--has-header` | `false` | CSV has header row |
-| `--recreate` | `false` | Drop and recreate table/views |
+| `--recreate` | `false` | Delete DB/WAL/SHM files and recreate from scratch |
+| `--recreate-pragmatic` | `false` | Delete DB file family only when this is the only user table; otherwise drop this table, vacuum, and truncate WAL |
 | `--import-mode` | `balanced` | Durability mode: safe/balanced/unsafe |
 | `--replace-existing` | `false` | Replace duplicates vs skip |
 | `--skip-order-check` | `false` | Allow non-increasing open_time |
@@ -122,6 +123,7 @@ Views filter by symbol, interval, year, and month for easy querying.
 1. **PRAGMA returns rows**: `PRAGMA journal_mode = WAL` returns a row, must use `conn.query()` not `conn.execute()`.
 2. **No WITHOUT ROWID**: Turso 0.5.3 does not support `WITHOUT ROWID` tables - creates standard tables only.
 3. **Experimental views**: Must enable with `.experimental_materialized_views(true)` in Builder.
+4. **WAL checkpoint returns rows**: `PRAGMA wal_checkpoint(TRUNCATE)` returns rows, so consume it with `query()`.
 
 ### Progress Bar
 
@@ -131,7 +133,7 @@ Views filter by symbol, interval, year, and month for easy querying.
 
 ### Resume/Skip Logic
 
-1. **View-based skip**: If monthly view exists and `--recreate` not set, skip entire file
+1. **View-based skip**: If monthly view exists and neither recreate mode is set, skip entire file
 2. **open_time skip**: If file's last `open_time` <= DB max, skip already-imported rows
 3. **Conflict mode**: Uses `INSERT OR IGNORE` by default; set `--replace-existing` for `INSERT OR REPLACE`
 
@@ -160,7 +162,10 @@ const PROGRESS_FLUSH_ROWS: u64 = 8192;  // Progress bar update batch size
 | `create_monthly_view()` | Create per-month filtering view |
 | `monthly_view_exists()` | Check if view exists for skip logic |
 | `max_open_time()` | Get max open_time from DB for resume |
+| `determine_recreate_action()` | Choose full file deletion vs table-only pragmatic recreation |
+| `remove_database_files()` | Delete DB, WAL, and SHM files for full recreation |
 | `apply_journal_mode()` | Set WAL mode (query-based workaround) |
+| `apply_wal_checkpoint_truncate()` | Flush DB changes and truncate WAL with row-consuming PRAGMA handling |
 | `sql_string_literal()` | Escape single quotes in SQL strings |
 | `ident_fragment()` | Sanitize identifiers to ASCII lowercase + underscore |
 
@@ -176,7 +181,7 @@ cargo build --release
 # Run CLI help
 cargo run --release -- --help
 
-# Quick smoke test (will skip existing data)
+# Quick smoke test (will skip existing data). Do not run against production DBs casually.
 cargo run --release -- --dir ../data --db ../db/solusdt.db --table klines_1s
 ```
 
