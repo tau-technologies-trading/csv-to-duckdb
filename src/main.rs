@@ -108,11 +108,6 @@ struct ParsedRow {
     values: Vec<Value>,
 }
 
-struct FileStats {
-    row_count: usize,
-    last_open_time: Option<i64>,
-}
-
 struct ProgressUi {
     multi: MultiProgress,
     total_bar: ProgressBar,
@@ -259,11 +254,6 @@ async fn main() -> Result<()> {
     warn_missing_months(&files);
 
     let rsi_count = infer_max_rsi_columns(&files, args.has_header)?;
-    let file_stats = collect_file_stats(&files, args.has_header)?;
-    let expected_rows = file_stats
-        .iter()
-        .map(|stats| stats.row_count)
-        .sum::<usize>();
     println!(
         "Found {} file(s). Max RSI columns: {}",
         files.len(),
@@ -311,25 +301,13 @@ async fn main() -> Result<()> {
     let start = Instant::now();
     let mut total_rows = 0usize;
     let mut last_open_time: Option<i64> = None;
-    let progress = ProgressUi::new("TOTAL ", Some(expected_rows as u64));
+    let progress = ProgressUi::new("TOTAL ", None);
 
     conn.execute("BEGIN", ()).await?;
 
-    for (file, stats) in files.iter().zip(file_stats.iter()) {
+    for file in files.iter() {
         let file_name = file.path.file_name().unwrap().to_string_lossy().to_string();
-        let mut progress_slot = progress.acquire_slot(&file_name, Some(stats.row_count as u64));
-
-        if should_skip_file(stats, resume_open_time) {
-            progress_slot.inc(stats.row_count as u64);
-            progress_slot.finish();
-
-            if let Some(file_last_open_time) = stats.last_open_time {
-                last_open_time = Some(file_last_open_time);
-            }
-
-            progress.println(format!("Imported {:>12} rows from {}", 0, file_name));
-            continue;
-        }
+        let mut progress_slot = progress.acquire_slot(&file_name, None);
 
         let imported = import_file(
             file,
@@ -583,53 +561,6 @@ fn infer_max_rsi_columns(files: &[CsvFile], has_header: bool) -> Result<usize> {
     }
 
     Ok(max_rsi)
-}
-
-fn collect_file_stats(files: &[CsvFile], has_header: bool) -> Result<Vec<FileStats>> {
-    files
-        .iter()
-        .map(|file| {
-            let mut reader = ReaderBuilder::new()
-                .has_headers(has_header)
-                .from_path(&file.path)
-                .with_context(|| format!("Cannot open {}", file.path.display()))?;
-
-            let mut record = StringRecord::new();
-            let mut row_count = 0usize;
-            let mut last_open_time = None;
-            while reader.read_record(&mut record)? {
-                if record.is_empty() {
-                    continue;
-                }
-
-                if record.len() < BINANCE_COLS {
-                    bail!(
-                        "{} has {} columns, expected at least {}",
-                        file.path.display(),
-                        record.len(),
-                        BINANCE_COLS
-                    );
-                }
-
-                row_count += 1;
-                last_open_time = Some(parse_i64(&record, 0, "open_time")?);
-            }
-
-            Ok(FileStats {
-                row_count,
-                last_open_time,
-            })
-        })
-        .collect()
-}
-
-fn should_skip_file(stats: &FileStats, resume_open_time: Option<i64>) -> bool {
-    match (stats.last_open_time, resume_open_time) {
-        (Some(file_last_open_time), Some(resume_open_time)) => {
-            file_last_open_time <= resume_open_time
-        }
-        _ => false,
-    }
 }
 
 async fn max_open_time(
