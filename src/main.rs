@@ -33,10 +33,10 @@ enum RecreateAction {
 #[derive(Parser, Debug)]
 #[command(
     about = "Import Binance Vision CSV files into a local Turso database",
-    long_about = "Import Binance Vision CSV files into a local Turso database.\n\nBy default this reads matching files like SOLUSDT-1s-2026-04.csv from the current directory, creates market_data.turso, and imports rows into klines_1s. Files are processed in year-month order. Existing rows are skipped by default so interrupted imports can be resumed safely. Use --auto N to import only the newest N matching CSV files, --recreate to delete the DB file family and rebuild from scratch, --recreate-pragmatic to rebuild only this table unless it is the DB's only user table, --replace-existing to overwrite duplicate primary keys, and --import-mode unsafe only when you are willing to delete and rebuild the database after a crash.",
+    long_about = "Import Binance Vision CSV files into a local Turso database.\n\nBy default this reads matching files like SOLUSDT-1s-2026-04.csv from the current directory, creates market_data.turso, and imports rows into klines. Files are processed in year-month order. Existing rows are skipped by default so interrupted imports can be resumed safely. Use --auto N to import only the newest N matching CSV files, --recreate to delete the DB file family and rebuild from scratch, --recreate-pragmatic to rebuild only this table unless it is the DB's only user table, --replace-existing to overwrite duplicate primary keys, and --import-mode unsafe only when you are willing to delete and rebuild the database after a crash.",
     version,
     disable_version_flag = true,
-    after_help = "Examples:\n  csv-to-turso -d ../data\n  csv-to-turso -d ../data --auto 3\n  csv-to-turso -d ../data -o sol.turso --recreate\n  csv-to-turso -d ../data -o sol.turso --recreate-pragmatic\n  csv-to-turso -d ../data --import-mode unsafe --batch-size 500000\n  csv-to-turso -d ../data --has-header --replace-existing\n  csv-to-turso -d ../data --symbol BTCUSDT --interval 1m --table klines_1m\n\nVerification:\n  tursodb --readonly market_data.turso 'SELECT COUNT(*) FROM klines_1s;'\n  tursodb --readonly market_data.turso 'SELECT MIN(open_time), MAX(open_time) FROM klines_1s;'\n\nNotes:\n  Defaults: --dir ., --db market_data.turso, --symbol SOLUSDT, --interval 1s, --table klines_1s.\n  Defaults: --batch-size 250000, --progress-every 1000000, --import-mode balanced.\n  Imports the 12 Binance Vision kline columns plus any extra generated RSI columns.\n  --auto N imports only the newest N matching CSV files and cannot be combined with recreate options.\n  For 120M-row imports, use --import-mode balanced first; use unsafe only if rebuilding after a crash is acceptable.\n  --recreate deletes the DB, WAL, and SHM files before importing.\n  --recreate-pragmatic deletes the DB file family only when the requested table is the only user table; otherwise it drops that table, vacuums, and truncates WAL.\n  --replace-existing rewrites duplicate primary keys; without it duplicates are ignored.\n  --skip-order-check allows non-increasing open_time values, but only use it when the files are intentionally unordered."
+    after_help = "Examples:\n  csv-to-turso -d ../data\n  csv-to-turso -d ../data --auto 3\n  csv-to-turso -d ../data -o sol.turso --recreate\n  csv-to-turso -d ../data -o sol.turso --recreate-pragmatic\n  csv-to-turso -d ../data --import-mode unsafe --batch-size 500000\n  csv-to-turso -d ../data --has-header --replace-existing\n  csv-to-turso -d ../data --symbol BTCUSDT --interval 1m --table btc_klines\n\nVerification:\n  tursodb --readonly market_data.turso 'SELECT COUNT(*) FROM klines;'\n  tursodb --readonly market_data.turso 'SELECT MIN(open_time), MAX(open_time) FROM klines;'\n\nNotes:\n  Defaults: --dir ., --db market_data.turso, --symbol SOLUSDT, --interval 1s, --table klines.\n  Defaults: --batch-size 250000, --progress-every 1000000, --import-mode balanced.\n  Imports the 12 Binance Vision kline columns plus any extra generated RSI columns.\n  --auto N imports only the newest N matching CSV files and cannot be combined with recreate options.\n  For 120M-row imports, use --import-mode balanced first; use unsafe only if rebuilding after a crash is acceptable.\n  --recreate deletes the DB, WAL, and SHM files before importing.\n  --recreate-pragmatic deletes the DB file family only when the requested table is the only user table; otherwise it drops that table, vacuums, and truncates WAL.\n  --replace-existing rewrites duplicate primary keys; without it duplicates are ignored.\n  --skip-order-check allows non-increasing open_time values, but only use it when the files are intentionally unordered."
 )]
 struct Args {
     /// Directory containing files like SOLUSDT-1s-2026-04.csv
@@ -56,7 +56,7 @@ struct Args {
     interval: String,
 
     /// SQL table name
-    #[arg(short, long, default_value = "klines_1s")]
+    #[arg(short, long, default_value = "klines")]
     table: String,
 
     /// Commit every N rows
@@ -297,7 +297,7 @@ async fn main() -> Result<()> {
     let resume_open_time = if args.replace_existing {
         None
     } else {
-        max_open_time(&conn, &args.table, &args.symbol, &args.interval).await?
+        max_open_time(&conn, &args.table).await?
     };
 
     let insert_sql = build_insert_sql(&args.table, rsi_count, args.replace_existing);
@@ -586,19 +586,9 @@ fn infer_max_rsi_columns(files: &[CsvFile], has_header: bool) -> Result<usize> {
     Ok(max_rsi)
 }
 
-async fn max_open_time(
-    conn: &turso::Connection,
-    table: &str,
-    symbol: &str,
-    interval: &str,
-) -> Result<Option<i64>> {
-    let sql = format!(
-        "SELECT MAX(open_time) FROM {} WHERE symbol = ?1 AND interval = ?2",
-        table
-    );
-    let mut rows = conn
-        .query(&sql, (symbol.to_string(), interval.to_string()))
-        .await?;
+async fn max_open_time(conn: &turso::Connection, table: &str) -> Result<Option<i64>> {
+    let sql = format!("SELECT MAX(open_time) FROM {}", table);
+    let mut rows = conn.query(&sql, ()).await?;
 
     let Some(row) = rows.next().await? else {
         return Ok(None);
@@ -613,10 +603,6 @@ async fn max_open_time(
 
 async fn create_table(conn: &turso::Connection, table: &str, rsi_count: usize) -> Result<()> {
     let mut cols = vec![
-        "symbol TEXT NOT NULL".to_string(),
-        "interval TEXT NOT NULL".to_string(),
-        "year INTEGER NOT NULL".to_string(),
-        "month INTEGER NOT NULL".to_string(),
         "open_time INTEGER NOT NULL".to_string(),
         "open REAL NOT NULL".to_string(),
         "high REAL NOT NULL".to_string(),
@@ -635,7 +621,7 @@ async fn create_table(conn: &turso::Connection, table: &str, rsi_count: usize) -
         cols.push(format!("rsi_{} REAL", i));
     }
 
-    cols.push("PRIMARY KEY (symbol, interval, open_time)".to_string());
+    cols.push("PRIMARY KEY (open_time)".to_string());
 
     let sql = format!("CREATE TABLE IF NOT EXISTS {} ({})", table, cols.join(", "));
 
@@ -645,10 +631,6 @@ async fn create_table(conn: &turso::Connection, table: &str, rsi_count: usize) -
 
 fn build_insert_sql(table: &str, rsi_count: usize, replace_existing: bool) -> String {
     let mut cols = vec![
-        "symbol",
-        "interval",
-        "year",
-        "month",
         "open_time",
         "open",
         "high",
@@ -727,15 +709,8 @@ async fn import_file(
             continue;
         }
 
-        let row = record_to_row(
-            &record,
-            &args.symbol,
-            &args.interval,
-            file.year,
-            file.month,
-            rsi_count,
-        )
-        .with_context(|| format!("Bad row in {}", file.path.display()))?;
+        let row = record_to_row(&record, rsi_count)
+            .with_context(|| format!("Bad row in {}", file.path.display()))?;
 
         if !args.skip_order_check {
             if let Some(prev_open_time) = *last_open_time {
@@ -786,14 +761,7 @@ async fn import_file(
     Ok(file_rows)
 }
 
-fn record_to_row(
-    record: &StringRecord,
-    symbol: &str,
-    interval: &str,
-    year: i32,
-    month: u32,
-    rsi_count: usize,
-) -> Result<ParsedRow> {
+fn record_to_row(record: &StringRecord, rsi_count: usize) -> Result<ParsedRow> {
     if record.len() < BINANCE_COLS {
         bail!(
             "row has {} columns, expected at least {}",
@@ -803,12 +771,8 @@ fn record_to_row(
     }
 
     let open_time = parse_i64(record, 0, "open_time")?;
-    let mut values = Vec::with_capacity(16 + rsi_count);
-
-    values.push(Value::from(symbol.to_string()));
-    values.push(Value::from(interval.to_string()));
-    values.push(Value::from(year as i64));
-    values.push(Value::from(month as i64));
+    // 12 is the Binance Vision kline column count; RSI columns are optional extras.
+    let mut values = Vec::with_capacity(BINANCE_COLS + rsi_count);
 
     values.push(Value::from(open_time));
     values.push(Value::from(parse_f64(record, 1, "open")?));

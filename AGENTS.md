@@ -24,7 +24,7 @@ turso = "0.5.3"              # Local Turso/SQLite database
 ### Basic Commands
 
 ```bash
-# Import with all defaults (SOLUSDT, 1s, klines_1s, market_data.turso)
+# Import with all defaults (SOLUSDT, 1s, klines, market_data.turso)
 cargo run --release -- --dir ../data
 
 # Specify output database
@@ -36,7 +36,7 @@ cargo run --release -- \
   --db ../db/solusdt.db \
   --symbol SOLUSDT \
   --interval 1s \
-  --table klines_1s
+  --table klines
 ```
 
 ### CLI Flags
@@ -47,7 +47,7 @@ cargo run --release -- \
 | `-o, --db` | `market_data.turso` | Output Turso database path |
 | `-s, --symbol` | `SOLUSDT` | Trading symbol to import |
 | `-i, --interval` | `1s` | Time interval (1s, 1m, etc.) |
-| `-t, --table` | `klines_1s` | SQL table name |
+| `-t, --table` | `klines` | SQL table name |
 | `-b, --batch-size` | `250000` | Rows per transaction commit |
 | `--progress-every` | `1000000` | Print progress every N rows |
 | `--has-header` | `false` | CSV has header row |
@@ -64,11 +64,7 @@ cargo run --release -- \
 tursodb --readonly --experimental-views ../db/solusdt.db '.tables'
 
 # Count rows
-tursodb --readonly --experimental-views ../db/solusdt.db 'SELECT COUNT(*) FROM klines_1s;'
-
-# List monthly views
-tursodb --readonly --experimental-views ../db/solusdt.db \
-  "SELECT name FROM sqlite_master WHERE type = 'view';"
+tursodb --readonly --experimental-views ../db/solusdt.db 'SELECT COUNT(*) FROM klines;'
 ```
 
 ## File Naming Convention
@@ -81,14 +77,10 @@ Examples:
 
 ## Database Schema
 
-### Table: `klines_1s` (default)
+### Table: `klines` (default)
 
 ```sql
-CREATE TABLE klines_1s (
-    symbol TEXT NOT NULL,
-    interval TEXT NOT NULL,
-    year INTEGER NOT NULL,
-    month INTEGER NOT NULL,
+CREATE TABLE klines (
     open_time INTEGER NOT NULL,
     open REAL NOT NULL,
     high REAL NOT NULL,
@@ -104,17 +96,9 @@ CREATE TABLE klines_1s (
     rsi_1 REAL,           -- Optional RSI columns inferred from CSV
     rsi_2 REAL,
     rsi_3 REAL,
-    PRIMARY KEY (symbol, interval, open_time)
+    PRIMARY KEY (open_time)
 );
 ```
-
-### Monthly Views
-
-One view per CSV file is created automatically:
-- Naming: `{table}_{symbol}_{interval}_{YYYY}_{MM}`
-- Example: `klines_1s_solusdt_1s_2020_08`
-
-Views filter by symbol, interval, year, and month for easy querying.
 
 ## Key Implementation Details
 
@@ -122,8 +106,7 @@ Views filter by symbol, interval, year, and month for easy querying.
 
 1. **PRAGMA returns rows**: `PRAGMA journal_mode = WAL` returns a row, must use `conn.query()` not `conn.execute()`.
 2. **No WITHOUT ROWID**: Turso 0.5.3 does not support `WITHOUT ROWID` tables - creates standard tables only.
-3. **Experimental views**: Must enable with `.experimental_materialized_views(true)` in Builder.
-4. **WAL checkpoint returns rows**: `PRAGMA wal_checkpoint(TRUNCATE)` returns rows, so consume it with `query()`.
+3. **WAL checkpoint returns rows**: `PRAGMA wal_checkpoint(TRUNCATE)` returns rows, so consume it with `query()`.
 
 ### Progress Bar
 
@@ -133,9 +116,8 @@ Views filter by symbol, interval, year, and month for easy querying.
 
 ### Resume/Skip Logic
 
-1. **View-based skip**: If monthly view exists and neither recreate mode is set, skip entire file
-2. **open_time skip**: If file's last `open_time` <= DB max, skip already-imported rows
-3. **Conflict mode**: Uses `INSERT OR IGNORE` by default; set `--replace-existing` for `INSERT OR REPLACE`
+1. **open_time skip**: Rows with `open_time` <= DB max are skipped
+2. **Conflict mode**: Uses `INSERT OR IGNORE` by default; set `--replace-existing` for `INSERT OR REPLACE`
 
 ### File Processing
 
@@ -156,18 +138,13 @@ const PROGRESS_FLUSH_ROWS: u64 = 8192;  // Progress bar update batch size
 | Function | Purpose |
 |----------|---------|
 | `find_files()` | Discover CSV files matching pattern |
-| `collect_file_stats()` | Count rows and find last open_time per file |
 | `create_table()` | Create klines table with inferred RSI columns |
 | `import_file()` | Import single CSV file with batching |
-| `create_monthly_view()` | Create per-month filtering view |
-| `monthly_view_exists()` | Check if view exists for skip logic |
 | `max_open_time()` | Get max open_time from DB for resume |
 | `determine_recreate_action()` | Choose full file deletion vs table-only pragmatic recreation |
 | `remove_database_files()` | Delete DB, WAL, and SHM files for full recreation |
 | `apply_journal_mode()` | Set WAL mode (query-based workaround) |
 | `apply_wal_checkpoint_truncate()` | Flush DB changes and truncate WAL with row-consuming PRAGMA handling |
-| `sql_string_literal()` | Escape single quotes in SQL strings |
-| `ident_fragment()` | Sanitize identifiers to ASCII lowercase + underscore |
 
 ## Testing
 
@@ -182,7 +159,7 @@ cargo build --release
 cargo run --release -- --help
 
 # Quick smoke test (will skip existing data). Do not run against production DBs casually.
-cargo run --release -- --dir ../data --db ../db/solusdt.db --table klines_1s
+cargo run --release -- --dir ../data --db ../db/solusdt.db --table klines
 ```
 
 ## Notes for AI Agents
