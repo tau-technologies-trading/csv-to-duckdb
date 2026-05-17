@@ -2,7 +2,8 @@ use anyhow::{Context, Result, bail};
 use clap::{Parser, ValueEnum};
 use csv::{ReaderBuilder, StringRecord};
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
-use std::fs;
+use std::fs::{self, File};
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
@@ -110,6 +111,11 @@ struct CsvFile {
 struct ParsedRow {
     open_time: i64,
     values: Vec<Value>,
+}
+
+struct FileStats {
+    row_count: usize,
+    last_open_time: Option<i64>,
 }
 
 struct ProgressUi {
@@ -259,10 +265,13 @@ async fn main() -> Result<()> {
     warn_missing_months(&files);
 
     let rsi_count = infer_max_rsi_columns(&files, args.has_header)?;
+    let file_stats = collect_file_stats(&files, args.has_header)?;
+    let expected_rows = file_stats.iter().map(|stats| stats.row_count).sum::<usize>();
     println!(
-        "Found {} file(s). Max RSI columns: {}",
+        "Found {} file(s). Max RSI columns: {}. Expected rows: {}",
         files.len(),
-        rsi_count
+        rsi_count,
+        expected_rows
     );
     println!(
         "Import mode: {:?}. Batch size: {}. Conflict mode: {}.",
@@ -306,13 +315,25 @@ async fn main() -> Result<()> {
     let start = Instant::now();
     let mut total_rows = 0usize;
     let mut last_open_time: Option<i64> = None;
-    let progress = ProgressUi::new("TOTAL ", None);
+    let progress = ProgressUi::new("TOTAL ", Some(expected_rows as u64));
 
     conn.execute("BEGIN", ()).await?;
 
-    for file in files.iter() {
+    for (file, stats) in files.iter().zip(file_stats.iter()) {
         let file_name = file.path.file_name().unwrap().to_string_lossy().to_string();
-        let mut progress_slot = progress.acquire_slot(&file_name, None);
+        let mut progress_slot = progress.acquire_slot(&file_name, Some(stats.row_count as u64));
+
+        if should_skip_file(stats, resume_open_time) {
+            progress_slot.inc(stats.row_count as u64);
+            progress_slot.finish();
+
+            if let Some(file_last_open_time) = stats.last_open_time {
+                last_open_time = Some(file_last_open_time);
+            }
+
+            progress.println(format!("Imported {:>12} rows from {}", 0, file_name));
+            continue;
+        }
 
         let imported = import_file(
             file,
@@ -584,6 +605,88 @@ fn infer_max_rsi_columns(files: &[CsvFile], has_header: bool) -> Result<usize> {
     }
 
     Ok(max_rsi)
+}
+
+fn collect_file_stats(files: &[CsvFile], has_header: bool) -> Result<Vec<FileStats>> {
+    files
+        .iter()
+        .map(|file| scan_file_stats(file, has_header))
+        .collect()
+}
+
+fn scan_file_stats(file: &CsvFile, has_header: bool) -> Result<FileStats> {
+    let file_handle = File::open(&file.path)
+        .with_context(|| format!("Cannot open {}", file.path.display()))?;
+    let mut reader = BufReader::new(file_handle);
+    let mut buffer = Vec::with_capacity(4096);
+    let mut skipped_header = false;
+    let mut row_count = 0usize;
+    let mut last_open_time = None;
+
+    loop {
+        buffer.clear();
+        let bytes_read = reader
+            .read_until(b'\n', &mut buffer)
+            .with_context(|| format!("Cannot read {}", file.path.display()))?;
+
+        if bytes_read == 0 {
+            break;
+        }
+
+        let line = trim_csv_line(&buffer);
+        if line.is_empty() {
+            continue;
+        }
+
+        if has_header && !skipped_header {
+            skipped_header = true;
+            continue;
+        }
+
+        row_count += 1;
+        last_open_time = Some(parse_open_time_bytes(line).with_context(|| {
+            format!("Bad open_time while scanning {}", file.path.display())
+        })?);
+    }
+
+    Ok(FileStats {
+        row_count,
+        last_open_time,
+    })
+}
+
+fn trim_csv_line(mut line: &[u8]) -> &[u8] {
+    while matches!(line.last(), Some(b'\n' | b'\r')) {
+        line = &line[..line.len() - 1];
+    }
+
+    if line.iter().all(|byte| byte.is_ascii_whitespace()) {
+        return &[];
+    }
+
+    line
+}
+
+fn parse_open_time_bytes(line: &[u8]) -> Result<i64> {
+    let first_field = line
+        .split(|byte| *byte == b',')
+        .next()
+        .context("missing open_time")?;
+    let raw = std::str::from_utf8(first_field)
+        .context("open_time is not valid UTF-8")?
+        .trim();
+
+    raw.parse::<i64>()
+        .with_context(|| format!("invalid open_time: {}", raw))
+}
+
+fn should_skip_file(stats: &FileStats, resume_open_time: Option<i64>) -> bool {
+    match (stats.last_open_time, resume_open_time) {
+        (Some(file_last_open_time), Some(resume_open_time)) => {
+            file_last_open_time <= resume_open_time
+        }
+        _ => false,
+    }
 }
 
 async fn max_open_time(conn: &turso::Connection, table: &str) -> Result<Option<i64>> {
