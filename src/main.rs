@@ -11,6 +11,10 @@ use turso::{Builder, Value, params_from_iter};
 
 const BINANCE_COLS: usize = 12;
 const PROGRESS_FLUSH_ROWS: u64 = 8192;
+const DEFAULT_SINGLE_DIR: &str = "../data/BTCUSDT/";
+const DEFAULT_SINGLE_DB: &str = "../db/BTCUSDT/BTCUSDT.db";
+const DEFAULT_ALL_DIR: &str = "../data/";
+const DEFAULT_ALL_DB_DIR: &str = "../db/";
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum ImportMode {
@@ -34,23 +38,19 @@ enum RecreateAction {
 #[derive(Parser, Debug)]
 #[command(
     about = "Import Binance Vision CSV files into a local Turso database",
-    long_about = "Import Binance Vision CSV files into a local Turso database.\n\nBy default this reads matching files like SOLUSDT-1s-2026-04.csv from the current directory, creates market_data.turso, and imports rows into klines. Files are processed in year-month order. Existing rows are skipped by default so interrupted imports can be resumed safely. Use --auto N to import only the newest N matching CSV files, --recreate to delete the DB file family and rebuild from scratch, --recreate-pragmatic to rebuild only this table unless it is the DB's only user table, --replace-existing to overwrite duplicate primary keys, and --import-mode unsafe only when you are willing to delete and rebuild the database after a crash.",
+    long_about = "Import Binance Vision CSV files into local Turso databases.\n\nBy default this reads matching files like BTCUSDT-1s-2026-04.csv from ../data/BTCUSDT/, creates ../db/BTCUSDT/BTCUSDT.db, and imports rows into klines. With --all, it scans ../data/ recursively and mirrors every directory containing CSVs into ../db/, creating one {symbol}.db per CSV directory. Files are processed in year-month order. Existing rows are skipped by default so interrupted imports can be resumed safely. Use --auto N to import only the newest N matching CSV files per job, --recreate to delete DB file families and rebuild from scratch, --recreate-pragmatic to rebuild only this table unless it is the DB's only user table, --replace-existing to overwrite duplicate primary keys, and --import-mode unsafe only when you are willing to delete and rebuild databases after a crash.",
     version,
     disable_version_flag = true,
-    after_help = "Examples:\n  csv-to-turso -d ../data\n  csv-to-turso -d ../data --auto 3\n  csv-to-turso -d ../data -o sol.turso --recreate\n  csv-to-turso -d ../data -o sol.turso --recreate-pragmatic\n  csv-to-turso -d ../data --import-mode unsafe --batch-size 500000\n  csv-to-turso -d ../data --has-header --replace-existing\n  csv-to-turso -d ../data --symbol BTCUSDT --interval 1m --table btc_klines\n\nVerification:\n  tursodb --readonly market_data.turso 'SELECT COUNT(*) FROM klines;'\n  tursodb --readonly market_data.turso 'SELECT MIN(open_time), MAX(open_time) FROM klines;'\n\nNotes:\n  Defaults: --dir ., --db market_data.turso, --symbol SOLUSDT, --interval 1s, --table klines.\n  Defaults: --batch-size 250000, --progress-every 1000000, --import-mode balanced.\n  Imports the 12 Binance Vision kline columns plus any extra generated RSI columns.\n  --auto N imports only the newest N matching CSV files and cannot be combined with recreate options.\n  For 120M-row imports, use --import-mode balanced first; use unsafe only if rebuilding after a crash is acceptable.\n  --recreate deletes the DB, WAL, and SHM files before importing.\n  --recreate-pragmatic deletes the DB file family only when the requested table is the only user table; otherwise it drops that table, vacuums, and truncates WAL.\n  --replace-existing rewrites duplicate primary keys; without it duplicates are ignored.\n  --skip-order-check allows non-increasing open_time values, but only use it when the files are intentionally unordered."
+    after_help = "Examples:\n  csv-to-turso\n  csv-to-turso --auto 3\n  csv-to-turso -o ../db/BTCUSDT/BTCUSDT.db --recreate\n  csv-to-turso --all\n  csv-to-turso --all -d ../data/ -o ../db/ --recreate-pragmatic\n  csv-to-turso --import-mode unsafe --batch-size 500000\n  csv-to-turso --has-header --replace-existing\n  csv-to-turso -d ../data/ETHUSDT --db ../db/ETHUSDT/ETHUSDT.db --interval 1m --table eth_klines\n\nVerification:\n  tursodb --readonly ../db/BTCUSDT/BTCUSDT.db 'SELECT COUNT(*) FROM klines;'\n  tursodb --readonly ../db/BTCUSDT/BTCUSDT.db 'SELECT MIN(open_time), MAX(open_time) FROM klines;'\n\nNotes:\n  Defaults: --dir ../data/BTCUSDT/, --db ../db/BTCUSDT/BTCUSDT.db, --interval 1s, --table klines.\n  Symbols are inferred from CSV filenames.\n  With --all and unchanged defaults: --dir ../data/, --db ../db/.\n  Defaults: --batch-size 250000, --progress-every 1000000, --import-mode balanced.\n  Imports the 12 Binance Vision kline columns plus any extra generated RSI columns.\n  --all recursively mirrors the input directory structure and creates one {symbol}.db per directory containing CSVs.\n  --auto N imports only the newest N matching CSV files per job and cannot be combined with recreate options.\n  For 120M-row imports, use --import-mode balanced first; use unsafe only if rebuilding after a crash is acceptable.\n  --recreate deletes the DB, WAL, and SHM files before importing.\n  --recreate-pragmatic deletes the DB file family only when the requested table is the only user table; otherwise it drops that table, vacuums, and truncates WAL.\n  --replace-existing rewrites duplicate primary keys; without it duplicates are ignored.\n  --skip-order-check allows non-increasing open_time values, but only use it when the files are intentionally unordered."
 )]
 struct Args {
-    /// Directory containing files like SOLUSDT-1s-2026-04.csv
-    #[arg(short, long, default_value = ".")]
+    /// Directory containing files like BTCUSDT-1s-2026-04.csv
+    #[arg(short, long, default_value = DEFAULT_SINGLE_DIR)]
     dir: PathBuf,
 
-    /// Output Turso database path
-    #[arg(short = 'o', long, default_value = "market_data.turso")]
+    /// Output Turso database path, or output root directory with --all
+    #[arg(short = 'o', long, default_value = DEFAULT_SINGLE_DB)]
     db: String,
-
-    /// Symbol to import
-    #[arg(short, long, default_value = "SOLUSDT")]
-    symbol: String,
 
     /// Interval per row
     #[arg(short, long, default_value = "1s")]
@@ -96,6 +96,10 @@ struct Args {
     #[arg(long)]
     auto: Option<usize>,
 
+    /// Recursively import every CSV directory and mirror the directory structure
+    #[arg(long, default_value_t = false)]
+    all: bool,
+
     /// Print version information and exit.
     #[arg(short = 'v', long = "version", action = clap::ArgAction::SetTrue, required = false)]
     version_flag: bool,
@@ -116,6 +120,14 @@ struct ParsedRow {
 struct FileStats {
     row_count: usize,
     last_open_time: Option<i64>,
+}
+
+struct ImportJob {
+    dir: PathBuf,
+    db_path: PathBuf,
+    symbol: String,
+    interval: String,
+    files: Vec<CsvFile>,
 }
 
 struct ProgressUi {
@@ -243,33 +255,58 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
+    let dir_arg_provided = arg_was_provided("-d", "--dir");
+    let db_arg_provided = arg_was_provided("-o", "--db");
     let args = Args::parse();
     let _ = args.version_flag;
 
     validate_args(&args)?;
     validate_ident(&args.table)?;
 
-    let mut files = find_files(&args.dir, &args.symbol, &args.interval)?;
-    files.sort_by_key(|f| (f.year, f.month));
-    apply_auto_file_limit(&mut files, args.auto);
+    let jobs = build_import_jobs(&args, dir_arg_provided, db_arg_provided)?;
+    if args.all {
+        println!("Found {} import job(s).", jobs.len());
+    }
 
-    if files.is_empty() {
+    for job in jobs {
+        run_import_job(&args, job).await?;
+    }
+
+    Ok(())
+}
+
+async fn run_import_job(args: &Args, mut job: ImportJob) -> Result<()> {
+    job.files.sort_by_key(|f| (f.year, f.month));
+    apply_auto_file_limit(&mut job.files, args.auto);
+
+    if job.files.is_empty() {
         bail!(
             "No files found matching {}-{}-YYYY-MM.csv in {}",
-            args.symbol,
-            args.interval,
-            args.dir.display()
+            job.symbol,
+            job.interval,
+            job.dir.display()
         );
     }
 
-    warn_missing_months(&files);
+    warn_missing_months(&job.files);
 
-    let rsi_count = infer_max_rsi_columns(&files, args.has_header)?;
-    let file_stats = collect_file_stats(&files, args.has_header)?;
-    let expected_rows = file_stats.iter().map(|stats| stats.row_count).sum::<usize>();
+    let rsi_count = infer_max_rsi_columns(&job.files, args.has_header)?;
+    let file_stats = collect_file_stats(&job.files, args.has_header)?;
+    let expected_rows = file_stats
+        .iter()
+        .map(|stats| stats.row_count)
+        .sum::<usize>();
+
+    println!(
+        "Importing {} {} from {} into {}",
+        job.symbol,
+        job.interval,
+        job.dir.display(),
+        job.db_path.display()
+    );
     println!(
         "Found {} file(s). Max RSI columns: {}. Expected rows: {}",
-        files.len(),
+        job.files.len(),
         rsi_count,
         expected_rows
     );
@@ -284,12 +321,18 @@ async fn main() -> Result<()> {
         }
     );
 
-    let recreate_action = determine_recreate_action(&args).await?;
-    if recreate_action == RecreateAction::DeleteDatabaseFiles {
-        remove_database_files(&args.db)?;
+    if let Some(parent) = job.db_path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("Cannot create {}", parent.display()))?;
     }
 
-    let db = Builder::new_local(&args.db).build().await?;
+    let db_path = job.db_path.to_string_lossy().to_string();
+    let recreate_action = determine_recreate_action(args, &db_path).await?;
+    if recreate_action == RecreateAction::DeleteDatabaseFiles {
+        remove_database_files(&db_path)?;
+    }
+
+    let db = Builder::new_local(&db_path).build().await?;
     let conn = db.connect()?;
 
     apply_import_mode(&conn, args.import_mode).await?;
@@ -319,7 +362,7 @@ async fn main() -> Result<()> {
 
     conn.execute("BEGIN", ()).await?;
 
-    for (file, stats) in files.iter().zip(file_stats.iter()) {
+    for (file, stats) in job.files.iter().zip(file_stats.iter()) {
         let file_name = file.path.file_name().unwrap().to_string_lossy().to_string();
         let mut progress_slot = progress.acquire_slot(&file_name, Some(stats.row_count as u64));
 
@@ -337,7 +380,7 @@ async fn main() -> Result<()> {
 
         let imported = import_file(
             file,
-            &args,
+            args,
             rsi_count,
             &mut stmt,
             &conn,
@@ -361,7 +404,7 @@ async fn main() -> Result<()> {
     let average_rows_per_second = total_rows as f64 / elapsed.max(0.001);
     println!(
         "Done. Imported {} rows into {} in {:.1}s (average speed {:.0} rows/second)",
-        total_rows, args.db, elapsed, average_rows_per_second
+        total_rows, db_path, elapsed, average_rows_per_second
     );
 
     Ok(())
@@ -369,6 +412,12 @@ async fn main() -> Result<()> {
 
 fn print_version() {
     println!("{} {}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
+}
+
+fn arg_was_provided(short: &str, long: &str) -> bool {
+    std::env::args_os().skip(1).any(|arg| {
+        arg == short || arg == long || arg.to_string_lossy().starts_with(&format!("{}=", long))
+    })
 }
 
 fn validate_args(args: &Args) -> Result<()> {
@@ -395,6 +444,217 @@ fn validate_args(args: &Args) -> Result<()> {
     Ok(())
 }
 
+fn build_import_jobs(
+    args: &Args,
+    dir_arg_provided: bool,
+    db_arg_provided: bool,
+) -> Result<Vec<ImportJob>> {
+    if args.all {
+        let dir = if dir_arg_provided {
+            args.dir.clone()
+        } else {
+            PathBuf::from(DEFAULT_ALL_DIR)
+        };
+        let db_root = if db_arg_provided {
+            PathBuf::from(&args.db)
+        } else {
+            PathBuf::from(DEFAULT_ALL_DB_DIR)
+        };
+
+        let mut jobs = Vec::new();
+        collect_all_import_jobs(&dir, &dir, &db_root, &mut jobs)?;
+        jobs.sort_by(|a, b| a.dir.cmp(&b.dir));
+
+        if jobs.is_empty() {
+            bail!("No CSV directories found in {}", dir.display());
+        }
+
+        return Ok(jobs);
+    }
+
+    Ok(vec![import_job_for_single_directory(
+        &args.dir,
+        PathBuf::from(&args.db),
+        &args.interval,
+    )?])
+}
+
+fn import_job_for_single_directory(
+    dir: &Path,
+    db_path: PathBuf,
+    interval: &str,
+) -> Result<ImportJob> {
+    let mut symbol: Option<String> = None;
+    let mut files = Vec::new();
+
+    for entry in fs::read_dir(dir).with_context(|| format!("Cannot read {}", dir.display()))? {
+        let entry = entry?;
+        let path = entry.path();
+
+        if !path.is_file() {
+            continue;
+        }
+
+        let Some(file_name) = path.file_name().and_then(|s| s.to_str()) else {
+            continue;
+        };
+
+        if !file_name.ends_with(".csv") {
+            continue;
+        }
+
+        let Some(parsed) = parse_filename(file_name) else {
+            eprintln!(
+                "Warning: ignoring CSV with unexpected name in {}: {}",
+                dir.display(),
+                file_name
+            );
+            continue;
+        };
+
+        if parsed.1 != interval {
+            continue;
+        }
+
+        match &symbol {
+            Some(existing) if existing != &parsed.0 => bail!(
+                "Mixed symbols for interval {} in {}: found both {} and {}",
+                interval,
+                dir.display(),
+                existing,
+                parsed.0
+            ),
+            None => symbol = Some(parsed.0.clone()),
+            _ => {}
+        }
+
+        files.push(CsvFile {
+            path,
+            year: parsed.2,
+            month: parsed.3,
+        });
+    }
+
+    let Some(symbol) = symbol else {
+        bail!(
+            "No files found matching *-{}-YYYY-MM.csv in {}",
+            interval,
+            dir.display()
+        );
+    };
+
+    Ok(ImportJob {
+        dir: dir.to_path_buf(),
+        db_path,
+        symbol,
+        interval: interval.to_string(),
+        files,
+    })
+}
+
+fn collect_all_import_jobs(
+    root: &Path,
+    dir: &Path,
+    db_root: &Path,
+    jobs: &mut Vec<ImportJob>,
+) -> Result<()> {
+    if let Some(job) = import_job_for_directory(root, dir, db_root)? {
+        jobs.push(job);
+    }
+
+    for entry in fs::read_dir(dir).with_context(|| format!("Cannot read {}", dir.display()))? {
+        let entry = entry?;
+        let path = entry.path();
+
+        if path.is_dir() {
+            collect_all_import_jobs(root, &path, db_root, jobs)?;
+        }
+    }
+
+    Ok(())
+}
+
+fn import_job_for_directory(root: &Path, dir: &Path, db_root: &Path) -> Result<Option<ImportJob>> {
+    let mut symbol: Option<String> = None;
+    let mut interval: Option<String> = None;
+    let mut files = Vec::new();
+
+    for entry in fs::read_dir(dir).with_context(|| format!("Cannot read {}", dir.display()))? {
+        let entry = entry?;
+        let path = entry.path();
+
+        if !path.is_file() {
+            continue;
+        }
+
+        let Some(file_name) = path.file_name().and_then(|s| s.to_str()) else {
+            continue;
+        };
+
+        if !file_name.ends_with(".csv") {
+            continue;
+        }
+
+        let Some(parsed) = parse_filename(file_name) else {
+            eprintln!(
+                "Warning: ignoring CSV with unexpected name in {}: {}",
+                dir.display(),
+                file_name
+            );
+            continue;
+        };
+
+        match &symbol {
+            Some(existing) if existing != &parsed.0 => bail!(
+                "Mixed symbols in {}: found both {} and {}",
+                dir.display(),
+                existing,
+                parsed.0
+            ),
+            None => symbol = Some(parsed.0.clone()),
+            _ => {}
+        }
+
+        match &interval {
+            Some(existing) if existing != &parsed.1 => bail!(
+                "Mixed intervals in {}: found both {} and {}",
+                dir.display(),
+                existing,
+                parsed.1
+            ),
+            None => interval = Some(parsed.1.clone()),
+            _ => {}
+        }
+
+        files.push(CsvFile {
+            path,
+            year: parsed.2,
+            month: parsed.3,
+        });
+    }
+
+    let Some(symbol) = symbol else {
+        return Ok(None);
+    };
+    let interval = interval.context("missing interval for discovered CSV directory")?;
+    let relative_dir = dir.strip_prefix(root).with_context(|| {
+        format!(
+            "Cannot map {} relative to input root {}",
+            dir.display(),
+            root.display()
+        )
+    })?;
+    let db_path = db_root.join(relative_dir).join(format!("{}.db", symbol));
+
+    Ok(Some(ImportJob {
+        dir: dir.to_path_buf(),
+        db_path,
+        symbol,
+        interval,
+        files,
+    }))
+}
+
 fn apply_auto_file_limit(files: &mut Vec<CsvFile>, auto: Option<usize>) {
     let Some(limit) = auto else {
         return;
@@ -405,7 +665,7 @@ fn apply_auto_file_limit(files: &mut Vec<CsvFile>, auto: Option<usize>) {
     }
 }
 
-async fn determine_recreate_action(args: &Args) -> Result<RecreateAction> {
+async fn determine_recreate_action(args: &Args, db_path: &str) -> Result<RecreateAction> {
     if args.recreate {
         return Ok(RecreateAction::DeleteDatabaseFiles);
     }
@@ -414,7 +674,7 @@ async fn determine_recreate_action(args: &Args) -> Result<RecreateAction> {
         return Ok(RecreateAction::None);
     }
 
-    let table_names = existing_user_tables(&args.db).await?;
+    let table_names = existing_user_tables(db_path).await?;
     if table_names.is_empty() || (table_names.len() == 1 && table_names[0] == args.table) {
         return Ok(RecreateAction::DeleteDatabaseFiles);
     }
@@ -497,37 +757,6 @@ async fn apply_wal_checkpoint_truncate(conn: &turso::Connection) -> Result<()> {
     let mut rows = conn.query("PRAGMA wal_checkpoint(TRUNCATE)", ()).await?;
     while rows.next().await?.is_some() {}
     Ok(())
-}
-
-fn find_files(dir: &Path, symbol: &str, interval: &str) -> Result<Vec<CsvFile>> {
-    let mut files = Vec::new();
-
-    for entry in fs::read_dir(dir).with_context(|| format!("Cannot read {}", dir.display()))? {
-        let entry = entry?;
-        let path = entry.path();
-
-        if !path.is_file() {
-            continue;
-        }
-
-        let Some(file_name) = path.file_name().and_then(|s| s.to_str()) else {
-            continue;
-        };
-
-        let Some(parsed) = parse_filename(file_name) else {
-            continue;
-        };
-
-        if parsed.0 == symbol && parsed.1 == interval {
-            files.push(CsvFile {
-                path,
-                year: parsed.2,
-                month: parsed.3,
-            });
-        }
-    }
-
-    Ok(files)
 }
 
 fn parse_filename(file_name: &str) -> Option<(String, String, i32, u32)> {
@@ -615,8 +844,8 @@ fn collect_file_stats(files: &[CsvFile], has_header: bool) -> Result<Vec<FileSta
 }
 
 fn scan_file_stats(file: &CsvFile, has_header: bool) -> Result<FileStats> {
-    let file_handle = File::open(&file.path)
-        .with_context(|| format!("Cannot open {}", file.path.display()))?;
+    let file_handle =
+        File::open(&file.path).with_context(|| format!("Cannot open {}", file.path.display()))?;
     let mut reader = BufReader::new(file_handle);
     let mut buffer = Vec::with_capacity(4096);
     let mut skipped_header = false;
@@ -644,9 +873,10 @@ fn scan_file_stats(file: &CsvFile, has_header: bool) -> Result<FileStats> {
         }
 
         row_count += 1;
-        last_open_time = Some(parse_open_time_bytes(line).with_context(|| {
-            format!("Bad open_time while scanning {}", file.path.display())
-        })?);
+        last_open_time =
+            Some(parse_open_time_bytes(line).with_context(|| {
+                format!("Bad open_time while scanning {}", file.path.display())
+            })?);
     }
 
     Ok(FileStats {

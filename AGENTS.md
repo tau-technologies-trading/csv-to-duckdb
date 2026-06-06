@@ -3,7 +3,7 @@
 ## Project Overview
 
 - **Name**: csv-to-turso
-- **Version**: 0.3.2
+- **Version**: 1.0.0
 - **Language**: Rust (edition 2024)
 - **Purpose**: Import Binance Vision CSV files into a local Turso (libSQL) database
 - **Repository**: `/home/nikolai/Coding/Quant/csv-to-turso`
@@ -24,17 +24,19 @@ turso = "0.5.3"              # Local Turso/SQLite database
 ### Basic Commands
 
 ```bash
-# Import with all defaults (SOLUSDT, 1s, klines, market_data.turso)
-cargo run --release -- --dir ../data
+# Import with all defaults (BTCUSDT, 1s, klines, ../db/BTCUSDT/BTCUSDT.db)
+cargo run --release --
 
 # Specify output database
-cargo run --release -- --dir ../data --db ../db/solusdt.db
+cargo run --release -- --db ../db/BTCUSDT/BTCUSDT.db
+
+# Import all symbols under ../data/ into mirrored DB folders under ../db/
+cargo run --release -- --all
 
 # Full long-form command
 cargo run --release -- \
-  --dir ../data \
-  --db ../db/solusdt.db \
-  --symbol SOLUSDT \
+  --dir ../data/BTCUSDT/ \
+  --db ../db/BTCUSDT/BTCUSDT.db \
   --interval 1s \
   --table klines
 ```
@@ -43,9 +45,8 @@ cargo run --release -- \
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `-d, --dir` | `.` | Directory containing CSV files |
-| `-o, --db` | `market_data.turso` | Output Turso database path |
-| `-s, --symbol` | `SOLUSDT` | Trading symbol to import |
+| `-d, --dir` | `../data/BTCUSDT/` | Directory containing CSV files |
+| `-o, --db` | `../db/BTCUSDT/BTCUSDT.db` | Output Turso database path, or output root directory with `--all` |
 | `-i, --interval` | `1s` | Time interval (1s, 1m, etc.) |
 | `-t, --table` | `klines` | SQL table name |
 | `-b, --batch-size` | `250000` | Rows per transaction commit |
@@ -56,15 +57,19 @@ cargo run --release -- \
 | `--import-mode` | `balanced` | Durability mode: safe/balanced/unsafe |
 | `--replace-existing` | `false` | Replace duplicates vs skip |
 | `--skip-order-check` | `false` | Allow non-increasing open_time |
+| `--all` | `false` | Recursively import every CSV directory; defaults become `--dir ../data/` and `--db ../db/` |
 
 ### Verification
 
 ```bash
 # List tables
-tursodb --readonly --experimental-views ../db/solusdt.db '.tables'
+tursodb --readonly --experimental-views ../db/BTCUSDT/BTCUSDT.db '.tables'
 
 # Count rows
-tursodb --readonly --experimental-views ../db/solusdt.db 'SELECT COUNT(*) FROM klines;'
+tursodb --readonly --experimental-views ../db/BTCUSDT/BTCUSDT.db 'SELECT COUNT(*) FROM klines;'
+
+# Example --all output
+tursodb --readonly --experimental-views ../db/ETHUSDT/ETHUSDT.db 'SELECT COUNT(*) FROM klines;'
 ```
 
 ## File Naming Convention
@@ -72,8 +77,8 @@ tursodb --readonly --experimental-views ../db/solusdt.db 'SELECT COUNT(*) FROM k
 CSV files must follow: `SYMBOL-INTERVAL-YYYY-MM.csv`
 
 Examples:
-- `SOLUSDT-1s-2020-08.csv`
 - `BTCUSDT-5m-2024-01.csv`
+- `ETHUSDT-1s-2020-08.csv`
 
 ## Database Schema
 
@@ -121,7 +126,9 @@ CREATE TABLE klines (
 
 ### File Processing
 
-- Files discovered via `find_files()` matching naming pattern
+- Single-import files are discovered by interval, with the symbol inferred from CSV filenames
+- `--all` recursively discovers every directory with valid CSVs and mirrors its relative path under the output root
+- `--all` requires each CSV directory to contain one symbol and one interval
 - Sorted by year-month order
 - Two-pass scan: first collects file stats (row count, last open_time), then imports
 - Column inference: first row determines RSI column count from extra CSV columns
@@ -137,7 +144,7 @@ const PROGRESS_FLUSH_ROWS: u64 = 8192;  // Progress bar update batch size
 
 | Function | Purpose |
 |----------|---------|
-| `find_files()` | Discover CSV files matching pattern |
+| `build_import_jobs()` | Build one import job or all mirrored recursive import jobs |
 | `create_table()` | Create klines table with inferred RSI columns |
 | `import_file()` | Import single CSV file with batching |
 | `max_open_time()` | Get max open_time from DB for resume |
@@ -159,7 +166,10 @@ cargo build --release
 cargo run --release -- --help
 
 # Quick smoke test (will skip existing data). Do not run against production DBs casually.
-cargo run --release -- --dir ../data --db ../db/solusdt.db --table klines
+cargo run --release -- --table klines
+
+# All-symbol smoke test
+cargo run --release -- --all
 ```
 
 ## Notes for AI Agents
