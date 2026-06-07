@@ -2,6 +2,15 @@
 name = "csv-to-turso"
 version = "1.0.0"
 edition = "2024"
+rust-version = "1.85"
+authors = ["Tau Technologies"]
+description = "CLI converting Binance Vision CSVs to a Turso .db file"
+readme = "README.md"
+repository = "https://github.com/tau-technologies-trading/csv-to-turso"
+homepage = "https://github.com/tau-technologies-trading/csv-to-turso"
+license = "MIT"
+keywords = ["turso", "binance", "csv", "trading", "cli"]
+categories = ["command-line-utilities"]
 
 [dependencies]
 anyhow = "1.0.102"
