@@ -30,7 +30,7 @@ Default behavior:
 cargo run --release -- --all
 ```
 
-With `--all`, the default input root changes to `../data/` and the default output root changes to `../db/`. Every directory containing valid CSV files is imported into its own `{symbol}.db`, and the relative directory structure is mirrored exactly.
+With `--all`, the default input root changes to `../data/` and the default output root changes to `../db/`. Every directory containing valid CSV files is imported into its own `{symbol}.db`, and the relative directory structure is mirrored exactly. Use `--jobs N` to process up to N CSV directories in parallel; files inside each directory are still imported sequentially in year-month order.
 
 Example:
 
@@ -63,6 +63,9 @@ cargo run --release -- --recreate
 # Import every CSV directory under ../data/ into mirrored folders under ../db/
 cargo run --release -- --all
 
+# Import up to 4 CSV directories in parallel
+cargo run --release -- --all --jobs 4
+
 # Use explicit roots for all-symbol import
 cargo run --release -- --all --dir ../data/ --db ../db/
 ```
@@ -85,6 +88,7 @@ cargo run --release -- --all --dir ../data/ --db ../db/
 | `--skip-order-check` | `false` | Allow non-increasing `open_time` values |
 | `--auto` | none | Import only the newest N matching CSV files per job |
 | `--all` | `false` | Recursively import every CSV directory and mirror the directory structure |
+| `--jobs` | `1` | Number of CSV directories to process in parallel with `--all` |
 
 ## CSV Naming
 

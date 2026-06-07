@@ -3,7 +3,7 @@
 ## Project Overview
 
 - **Name**: csv-to-turso
-- **Version**: 1.0.0
+- **Version**: 1.1.0
 - **Language**: Rust (edition 2024)
 - **Purpose**: Import Binance Vision CSV files into a local Turso (libSQL) database
 - **Repository**: `/home/nikolai/Coding/Quant/csv-to-turso`
@@ -33,6 +33,9 @@ cargo run --release -- --db ../db/BTCUSDT/BTCUSDT.db
 # Import all symbols under ../data/ into mirrored DB folders under ../db/
 cargo run --release -- --all
 
+# Import up to 4 CSV directories in parallel with --all
+cargo run --release -- --all --jobs 4
+
 # Full long-form command
 cargo run --release -- \
   --dir ../data/BTCUSDT/ \
@@ -57,7 +60,9 @@ cargo run --release -- \
 | `--import-mode` | `balanced` | Durability mode: safe/balanced/unsafe |
 | `--replace-existing` | `false` | Replace duplicates vs skip |
 | `--skip-order-check` | `false` | Allow non-increasing open_time |
+| `--auto` | none | Import only the newest N matching CSV files per job |
 | `--all` | `false` | Recursively import every CSV directory; defaults become `--dir ../data/` and `--db ../db/` |
+| `--jobs` | `1` | Number of CSV directories to process in parallel with `--all` |
 
 ### Verification
 
@@ -129,6 +134,7 @@ CREATE TABLE klines (
 - Single-import files are discovered by interval, with the symbol inferred from CSV filenames
 - `--all` recursively discovers every directory with valid CSVs and mirrors its relative path under the output root
 - `--all` requires each CSV directory to contain one symbol and one interval
+- `--jobs` controls how many `--all` CSV directories are imported in parallel; files inside each directory remain sequential
 - Sorted by year-month order
 - Two-pass scan: first collects file stats (row count, last open_time), then imports
 - Column inference: first row determines RSI column count from extra CSV columns
@@ -170,6 +176,9 @@ cargo run --release -- --table klines
 
 # All-symbol smoke test
 cargo run --release -- --all
+
+# Parallel all-symbol smoke test
+cargo run --release -- --all --jobs 4
 ```
 
 ## Notes for AI Agents

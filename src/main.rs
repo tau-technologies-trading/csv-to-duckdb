@@ -38,11 +38,12 @@ enum RecreateAction {
 #[derive(Parser, Debug)]
 #[command(
     about = "Import Binance Vision CSV files into a local Turso database",
-    long_about = "Import Binance Vision CSV files into local Turso databases.\n\nBy default this reads matching files like BTCUSDT-1s-2026-04.csv from ../data/BTCUSDT/, creates ../db/BTCUSDT/BTCUSDT.db, and imports rows into klines. With --all, it scans ../data/ recursively and mirrors every directory containing CSVs into ../db/, creating one {symbol}.db per CSV directory. Files are processed in year-month order. Existing rows are skipped by default so interrupted imports can be resumed safely. Use --auto N to import only the newest N matching CSV files per job, --recreate to delete DB file families and rebuild from scratch, --recreate-pragmatic to rebuild only this table unless it is the DB's only user table, --replace-existing to overwrite duplicate primary keys, and --import-mode unsafe only when you are willing to delete and rebuild databases after a crash.",
+    long_about = "Import Binance Vision CSV files into local Turso databases.\n\nBy default this reads matching files like BTCUSDT-1s-2026-04.csv from ../data/BTCUSDT/, creates ../db/BTCUSDT/BTCUSDT.db, and imports rows into klines. With --all, it scans ../data/ recursively and mirrors every directory containing CSVs into ../db/, creating one {symbol}.db per CSV directory. Use --jobs N with --all to process up to N folders in parallel. Files within each folder are processed in year-month order. Existing rows are skipped by default so interrupted imports can be resumed safely. Use --auto N to import only the newest N matching CSV files per job, --recreate to delete DB file families and rebuild from scratch, --recreate-pragmatic to rebuild only this table unless it is the DB's only user table, --replace-existing to overwrite duplicate primary keys, and --import-mode unsafe only when you are willing to delete and rebuild databases after a crash.",
     version,
     disable_version_flag = true,
-    after_help = "Examples:\n  csv-to-turso\n  csv-to-turso --auto 3\n  csv-to-turso -o ../db/BTCUSDT/BTCUSDT.db --recreate\n  csv-to-turso --all\n  csv-to-turso --all -d ../data/ -o ../db/ --recreate-pragmatic\n  csv-to-turso --import-mode unsafe --batch-size 500000\n  csv-to-turso --has-header --replace-existing\n  csv-to-turso -d ../data/ETHUSDT --db ../db/ETHUSDT/ETHUSDT.db --interval 1m --table eth_klines\n\nVerification:\n  tursodb --readonly ../db/BTCUSDT/BTCUSDT.db 'SELECT COUNT(*) FROM klines;'\n  tursodb --readonly ../db/BTCUSDT/BTCUSDT.db 'SELECT MIN(open_time), MAX(open_time) FROM klines;'\n\nNotes:\n  Defaults: --dir ../data/BTCUSDT/, --db ../db/BTCUSDT/BTCUSDT.db, --interval 1s, --table klines.\n  Symbols are inferred from CSV filenames.\n  With --all and unchanged defaults: --dir ../data/, --db ../db/.\n  Defaults: --batch-size 250000, --progress-every 1000000, --import-mode balanced.\n  Imports the 12 Binance Vision kline columns plus any extra generated RSI columns.\n  --all recursively mirrors the input directory structure and creates one {symbol}.db per directory containing CSVs.\n  --auto N imports only the newest N matching CSV files per job and cannot be combined with recreate options.\n  For 120M-row imports, use --import-mode balanced first; use unsafe only if rebuilding after a crash is acceptable.\n  --recreate deletes the DB, WAL, and SHM files before importing.\n  --recreate-pragmatic deletes the DB file family only when the requested table is the only user table; otherwise it drops that table, vacuums, and truncates WAL.\n  --replace-existing rewrites duplicate primary keys; without it duplicates are ignored.\n  --skip-order-check allows non-increasing open_time values, but only use it when the files are intentionally unordered."
+    after_help = "Examples:\n  csv-to-turso\n  csv-to-turso --auto 3\n  csv-to-turso -o ../db/BTCUSDT/BTCUSDT.db --recreate\n  csv-to-turso --all\n  csv-to-turso --all --jobs 4\n  csv-to-turso --all -d ../data/ -o ../db/ --recreate-pragmatic\n  csv-to-turso --import-mode unsafe --batch-size 500000\n  csv-to-turso --has-header --replace-existing\n  csv-to-turso -d ../data/ETHUSDT --db ../db/ETHUSDT/ETHUSDT.db --interval 1m --table eth_klines\n\nVerification:\n  tursodb --readonly ../db/BTCUSDT/BTCUSDT.db 'SELECT COUNT(*) FROM klines;'\n  tursodb --readonly ../db/BTCUSDT/BTCUSDT.db 'SELECT MIN(open_time), MAX(open_time) FROM klines;'\n\nNotes:\n  Defaults: --dir ../data/BTCUSDT/, --db ../db/BTCUSDT/BTCUSDT.db, --interval 1s, --table klines.\n  Symbols are inferred from CSV filenames.\n  With --all and unchanged defaults: --dir ../data/, --db ../db/.\n  Defaults: --batch-size 250000, --progress-every 1000000, --import-mode balanced, --jobs 1.\n  Imports the 12 Binance Vision kline columns plus any extra generated RSI columns.\n  --all recursively mirrors the input directory structure and creates one {symbol}.db per directory containing CSVs.\n  --jobs N only affects --all and processes up to N CSV directories in parallel; files inside each directory remain sequential.\n  --auto N imports only the newest N matching CSV files per job and cannot be combined with recreate options.\n  For 120M-row imports, use --import-mode balanced first; use unsafe only if rebuilding after a crash is acceptable.\n  --recreate deletes the DB, WAL, and SHM files before importing.\n  --recreate-pragmatic deletes the DB file family only when the requested table is the only user table; otherwise it drops that table, vacuums, and truncates WAL.\n  --replace-existing rewrites duplicate primary keys; without it duplicates are ignored.\n  --skip-order-check allows non-increasing open_time values, but only use it when the files are intentionally unordered."
 )]
+#[derive(Clone)]
 struct Args {
     /// Directory containing files like BTCUSDT-1s-2026-04.csv
     #[arg(short, long, default_value = DEFAULT_SINGLE_DIR)]
@@ -99,6 +100,10 @@ struct Args {
     /// Recursively import every CSV directory and mirror the directory structure
     #[arg(long, default_value_t = false)]
     all: bool,
+
+    /// Number of CSV directories to process in parallel with --all
+    #[arg(long, default_value_t = 1)]
+    jobs: usize,
 
     /// Print version information and exit.
     #[arg(short = 'v', long = "version", action = clap::ArgAction::SetTrue, required = false)]
@@ -265,14 +270,52 @@ async fn main() -> Result<()> {
 
     let jobs = build_import_jobs(&args, dir_arg_provided, db_arg_provided)?;
     if args.all {
-        println!("Found {} import job(s).", jobs.len());
-    }
-
-    for job in jobs {
-        run_import_job(&args, job).await?;
+        let max_parallel = args.jobs.min(jobs.len());
+        println!(
+            "Found {} import job(s). Processing up to {} folder(s) in parallel.",
+            jobs.len(),
+            max_parallel
+        );
+        run_all_import_jobs(args, jobs).await?;
+    } else {
+        for job in jobs {
+            run_import_job(&args, job).await?;
+        }
     }
 
     Ok(())
+}
+
+async fn run_all_import_jobs(args: Args, jobs: Vec<ImportJob>) -> Result<()> {
+    let max_parallel = args.jobs.min(jobs.len());
+    let args = Arc::new(args);
+    let mut jobs = jobs.into_iter();
+    let mut running = tokio::task::JoinSet::new();
+
+    for _ in 0..max_parallel {
+        let Some(job) = jobs.next() else {
+            break;
+        };
+        spawn_import_job(&mut running, Arc::clone(&args), job);
+    }
+
+    while let Some(result) = running.join_next().await {
+        result.context("import task failed to complete")??;
+
+        if let Some(job) = jobs.next() {
+            spawn_import_job(&mut running, Arc::clone(&args), job);
+        }
+    }
+
+    Ok(())
+}
+
+fn spawn_import_job(
+    running: &mut tokio::task::JoinSet<Result<()>>,
+    args: Arc<Args>,
+    job: ImportJob,
+) {
+    running.spawn(async move { run_import_job(&args, job).await });
 }
 
 async fn run_import_job(args: &Args, mut job: ImportJob) -> Result<()> {
@@ -427,6 +470,10 @@ fn validate_args(args: &Args) -> Result<()> {
 
     if args.progress_every == 0 {
         bail!("--progress-every must be greater than 0");
+    }
+
+    if args.jobs == 0 {
+        bail!("--jobs must be greater than 0");
     }
 
     if args.recreate && args.recreate_pragmatic {
