@@ -137,7 +137,12 @@ struct ImportJob {
 
 struct ProgressUi {
     multi: MultiProgress,
+}
+
+struct JobProgress {
+    ui: Arc<ProgressUi>,
     total_bar: ProgressBar,
+    finished: bool,
 }
 
 struct ProgressSlot {
@@ -147,24 +152,43 @@ struct ProgressSlot {
 }
 
 impl ProgressUi {
-    fn new(stage: impl Into<String>, total_rows: Option<u64>) -> Arc<Self> {
+    fn new() -> Arc<Self> {
         let multi = MultiProgress::new();
 
+        Arc::new(Self { multi })
+    }
+
+    fn start_job(self: &Arc<Self>, name: &str, total_rows: Option<u64>) -> JobProgress {
         let total_bar = match total_rows {
-            Some(total_rows) => multi.add(ProgressBar::new(total_rows)),
-            None => multi.add(ProgressBar::new_spinner()),
+            Some(total_rows) => self.multi.add(ProgressBar::new(total_rows)),
+            None => self.multi.add(ProgressBar::new_spinner()),
         };
-        total_bar.set_prefix(stage.into());
+        total_bar.set_prefix(truncate_progress_prefix(name));
         total_bar.set_message("importing files sequentially");
         total_bar.set_style(total_progress_style(total_rows.is_some()));
 
-        Arc::new(Self { multi, total_bar })
+        JobProgress {
+            ui: Arc::clone(self),
+            total_bar,
+            finished: false,
+        }
     }
 
-    fn acquire_slot(self: &Arc<Self>, name: &str, total_rows: Option<u64>) -> ProgressSlot {
+    fn println(&self, message: impl AsRef<str>) {
+        let message = message.as_ref();
+        if self.multi.is_hidden() {
+            println!("{message}");
+        } else {
+            let _ = self.multi.println(message);
+        }
+    }
+}
+
+impl JobProgress {
+    fn acquire_slot(&self, name: &str, total_rows: Option<u64>) -> ProgressSlot {
         let file_bar = match total_rows {
-            Some(total_rows) => self.multi.add(ProgressBar::new(total_rows)),
-            None => self.multi.add(ProgressBar::new_spinner()),
+            Some(total_rows) => self.ui.multi.add(ProgressBar::new(total_rows)),
+            None => self.ui.multi.add(ProgressBar::new_spinner()),
         };
         file_bar.set_style(file_progress_style(total_rows.is_some()));
         file_bar.set_message(truncate_progress_name(name));
@@ -176,12 +200,23 @@ impl ProgressUi {
         }
     }
 
-    fn finish(&self) {
-        self.total_bar.finish_and_clear();
+    fn println(&self, message: impl AsRef<str>) {
+        self.ui.println(message);
     }
 
-    fn println(&self, message: impl AsRef<str>) {
-        let _ = self.total_bar.println(message.as_ref());
+    fn finish(&mut self) {
+        if self.finished {
+            return;
+        }
+
+        self.total_bar.finish_and_clear();
+        self.finished = true;
+    }
+}
+
+impl Drop for JobProgress {
+    fn drop(&mut self) {
+        self.finish();
     }
 }
 
@@ -250,6 +285,15 @@ fn truncate_progress_name(file_name: &str) -> String {
     shortened
 }
 
+fn truncate_progress_prefix(name: &str) -> String {
+    const MAX_LEN: usize = 7;
+    if name.chars().count() <= MAX_LEN {
+        return name.to_owned();
+    }
+
+    name.chars().take(MAX_LEN).collect()
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     if std::env::args_os()
@@ -278,8 +322,9 @@ async fn main() -> Result<()> {
         );
         run_all_import_jobs(args, jobs).await?;
     } else {
+        let progress_ui = ProgressUi::new();
         for job in jobs {
-            run_import_job(&args, job).await?;
+            run_import_job(&args, job, Arc::clone(&progress_ui)).await?;
         }
     }
 
@@ -289,6 +334,7 @@ async fn main() -> Result<()> {
 async fn run_all_import_jobs(args: Args, jobs: Vec<ImportJob>) -> Result<()> {
     let max_parallel = args.jobs.min(jobs.len());
     let args = Arc::new(args);
+    let progress_ui = ProgressUi::new();
     let mut jobs = jobs.into_iter();
     let mut running = tokio::task::JoinSet::new();
 
@@ -296,14 +342,24 @@ async fn run_all_import_jobs(args: Args, jobs: Vec<ImportJob>) -> Result<()> {
         let Some(job) = jobs.next() else {
             break;
         };
-        spawn_import_job(&mut running, Arc::clone(&args), job);
+        spawn_import_job(
+            &mut running,
+            Arc::clone(&args),
+            job,
+            Arc::clone(&progress_ui),
+        );
     }
 
     while let Some(result) = running.join_next().await {
         result.context("import task failed to complete")??;
 
         if let Some(job) = jobs.next() {
-            spawn_import_job(&mut running, Arc::clone(&args), job);
+            spawn_import_job(
+                &mut running,
+                Arc::clone(&args),
+                job,
+                Arc::clone(&progress_ui),
+            );
         }
     }
 
@@ -314,11 +370,16 @@ fn spawn_import_job(
     running: &mut tokio::task::JoinSet<Result<()>>,
     args: Arc<Args>,
     job: ImportJob,
+    progress_ui: Arc<ProgressUi>,
 ) {
-    running.spawn(async move { run_import_job(&args, job).await });
+    running.spawn(async move { run_import_job(&args, job, progress_ui).await });
 }
 
-async fn run_import_job(args: &Args, mut job: ImportJob) -> Result<()> {
+async fn run_import_job(
+    args: &Args,
+    mut job: ImportJob,
+    progress_ui: Arc<ProgressUi>,
+) -> Result<()> {
     job.files.sort_by_key(|f| (f.year, f.month));
     apply_auto_file_limit(&mut job.files, args.auto);
 
@@ -331,7 +392,7 @@ async fn run_import_job(args: &Args, mut job: ImportJob) -> Result<()> {
         );
     }
 
-    warn_missing_months(&job.files);
+    warn_missing_months(&job.files, &progress_ui);
 
     let rsi_count = infer_max_rsi_columns(&job.files, args.has_header)?;
     let file_stats = collect_file_stats(&job.files, args.has_header)?;
@@ -340,20 +401,20 @@ async fn run_import_job(args: &Args, mut job: ImportJob) -> Result<()> {
         .map(|stats| stats.row_count)
         .sum::<usize>();
 
-    println!(
+    progress_ui.println(format!(
         "Importing {} {} from {} into {}",
         job.symbol,
         job.interval,
         job.dir.display(),
         job.db_path.display()
-    );
-    println!(
+    ));
+    progress_ui.println(format!(
         "Found {} file(s). Max RSI columns: {}. Expected rows: {}",
         job.files.len(),
         rsi_count,
         expected_rows
-    );
-    println!(
+    ));
+    progress_ui.println(format!(
         "Import mode: {:?}. Batch size: {}. Conflict mode: {}.",
         args.import_mode,
         args.batch_size,
@@ -362,7 +423,7 @@ async fn run_import_job(args: &Args, mut job: ImportJob) -> Result<()> {
         } else {
             "IGNORE"
         }
-    );
+    ));
 
     if let Some(parent) = job.db_path.parent() {
         fs::create_dir_all(parent)
@@ -401,7 +462,7 @@ async fn run_import_job(args: &Args, mut job: ImportJob) -> Result<()> {
     let start = Instant::now();
     let mut total_rows = 0usize;
     let mut last_open_time: Option<i64> = None;
-    let progress = ProgressUi::new("TOTAL ", Some(expected_rows as u64));
+    let mut progress = progress_ui.start_job(&job.symbol, Some(expected_rows as u64));
 
     conn.execute("BEGIN", ()).await?;
 
@@ -445,10 +506,10 @@ async fn run_import_job(args: &Args, mut job: ImportJob) -> Result<()> {
 
     let elapsed = start.elapsed().as_secs_f64();
     let average_rows_per_second = total_rows as f64 / elapsed.max(0.001);
-    println!(
+    progress_ui.println(format!(
         "Done. Imported {} rows into {} in {:.1}s (average speed {:.0} rows/second)",
         total_rows, db_path, elapsed, average_rows_per_second
-    );
+    ));
 
     Ok(())
 }
@@ -826,7 +887,7 @@ fn parse_filename(file_name: &str) -> Option<(String, String, i32, u32)> {
     Some((symbol, interval, year, month))
 }
 
-fn warn_missing_months(files: &[CsvFile]) {
+fn warn_missing_months(files: &[CsvFile], progress_ui: &ProgressUi) {
     if files.len() < 2 {
         return;
     }
@@ -843,10 +904,10 @@ fn warn_missing_months(files: &[CsvFile]) {
         }
 
         if next.year != expected_year || next.month != expected_month {
-            eprintln!(
+            progress_ui.println(format!(
                 "Warning: missing month(s) between {:04}-{:02} and {:04}-{:02}",
                 prev.year, prev.month, next.year, next.month
-            );
+            ));
         }
     }
 }
