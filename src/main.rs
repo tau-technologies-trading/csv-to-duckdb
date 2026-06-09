@@ -223,14 +223,14 @@ impl Drop for JobProgress {
 fn total_progress_style(has_total: bool) -> ProgressStyle {
     if has_total {
         return ProgressStyle::with_template(
-            "{prefix:<7} [{elapsed_precise}] [{bar:40.cyan/blue}] {percent:>3}% {pos}/{len} rows ({per_sec}, ETA {eta}) {msg}",
+            "{prefix:<10} [{elapsed_precise}] [{bar:40.cyan/blue}] {percent:>3}% {pos}/{len} rows ({per_sec}, ETA {eta}) {msg}",
         )
         .expect("valid total progress-bar template")
         .progress_chars("##-");
     }
 
     ProgressStyle::with_template(
-        "{prefix:<7} [{elapsed_precise}] {spinner:.green} {pos} rows ({per_sec}) {msg}",
+        "{prefix:<10} [{elapsed_precise}] {spinner:.green} {pos} rows ({per_sec}) {msg}",
     )
     .expect("valid total spinner template")
 }
