@@ -6,6 +6,7 @@ use std::fs::{self, File};
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::thread;
 use std::time::Instant;
 use turso::{Builder, Value, params_from_iter};
 
@@ -304,6 +305,10 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
+    if std::env::args().len() == 1 {
+        bail!("no arguments provided; use --help for usage");
+    }
+
     let dir_arg_provided = arg_was_provided("-d", "--dir");
     let db_arg_provided = arg_was_provided("-o", "--db");
     let args = Args::parse();
@@ -311,6 +316,21 @@ async fn main() -> Result<()> {
 
     validate_args(&args)?;
     validate_ident(&args.table)?;
+
+    let mut args = args;
+    if args.all {
+        let cpus = thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1);
+        if args.jobs > cpus {
+            let old = args.jobs;
+            args.jobs = cpus;
+            eprintln!(
+                "Warning: --jobs {} exceeds available system threads ({}); capped to {}",
+                old, cpus, args.jobs
+            );
+        }
+    }
 
     let jobs = build_import_jobs(&args, dir_arg_provided, db_arg_provided)?;
     if args.all {
