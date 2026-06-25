@@ -1,21 +1,20 @@
 [package]
-name = "csv-to-turso"
-version = "1.1.2"
+name = "csv-to-duckdb"
+version = "1.0.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.87"
 authors = ["Tau Technologies"]
-description = "CLI converting Binance Vision CSVs to a Turso .db file"
+description = "CLI converting Binance Vision CSVs to a DuckDB .duckdb file"
 readme = "README.md"
-repository = "https://github.com/tau-technologies-trading/csv-to-turso"
-homepage = "https://github.com/tau-technologies-trading/csv-to-turso"
+repository = "https://github.com/tau-technologies-trading/csv-to-duckdb"
+homepage = "https://github.com/tau-technologies-trading/csv-to-duckdb"
 license = "MIT"
-keywords = ["turso", "binance", "csv", "trading", "cli"]
+keywords = ["duckdb", "binance", "csv", "trading", "cli"]
 categories = ["command-line-utilities"]
 
 [dependencies]
 anyhow = "1.0.102"
 clap = { version = "4.6.1", features = ["derive"] }
 csv = "1.4.0"
+duckdb = { version = "1.10504", features = ["bundled"] }
 indicatif = "0.18"
-tokio = { version = "1.52.3", features = ["full"] }
-turso = "0.6.1"

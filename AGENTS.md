@@ -1,12 +1,9 @@
-# AGENTS.md - csv-to-turso
+# AGENTS.md - csv-to-duckdb
 
 ## Project Overview
 
-- **Name**: csv-to-turso
-- **Version**: 1.1.0
 - **Language**: Rust (edition 2024)
-- **Purpose**: Import Binance Vision CSV files into a local Turso (libSQL) database
-- **Repository**: `/home/nikolai/Coding/Quant/csv-to-turso`
+- **Purpose**: Import Binance Vision CSV files into a local DuckDB database
 
 ## Dependencies
 
@@ -14,9 +11,8 @@
 anyhow = "1.0.102"           # Error handling
 clap = { version = "4.6.1", features = ["derive"] }  # CLI argument parsing
 csv = "1.4.0"                # CSV reading
-indicatif = "0.17"            # Progress bar UI
-tokio = { version = "1.52.3", features = ["full"] } # Async runtime
-turso = "0.5.3"              # Local Turso/SQLite database
+indicatif = "0.18"            # Progress bar UI
+duckdb = { version = "1.10504", features = ["bundled"] }  # DuckDB (columnar DB)
 ```
 
 ## CLI Usage
@@ -24,11 +20,11 @@ turso = "0.5.3"              # Local Turso/SQLite database
 ### Basic Commands
 
 ```bash
-# Import with all defaults (BTCUSDT, 1s, klines, ../db/BTCUSDT/BTCUSDT.db)
-cargo run --release --
+# Import with default paths (BTCUSDT, 1s, klines, ../db/BTCUSDT/BTCUSDT.duckdb)
+cargo run --release -- --dir ../data/BTCUSDT/
 
 # Specify output database
-cargo run --release -- --db ../db/BTCUSDT/BTCUSDT.db
+cargo run --release -- --db ../db/BTCUSDT/BTCUSDT.duckdb
 
 # Import all symbols under ../data/ into mirrored DB folders under ../db/
 cargo run --release -- --all
@@ -39,7 +35,7 @@ cargo run --release -- --all --jobs 4
 # Full long-form command
 cargo run --release -- \
   --dir ../data/BTCUSDT/ \
-  --db ../db/BTCUSDT/BTCUSDT.db \
+  --db ../db/BTCUSDT/BTCUSDT.duckdb \
   --interval 1s \
   --table klines
 ```
@@ -49,32 +45,45 @@ cargo run --release -- \
 | Flag | Default | Description |
 |------|---------|-------------|
 | `-d, --dir` | `../data/BTCUSDT/` | Directory containing CSV files |
-| `-o, --db` | `../db/BTCUSDT/BTCUSDT.db` | Output Turso database path, or output root directory with `--all` |
+| `-o, --db` | `../db/BTCUSDT/BTCUSDT.duckdb` | Output DuckDB database path, or output root directory with `--all` |
 | `-i, --interval` | `1s` | Time interval (1s, 1m, etc.) |
 | `-t, --table` | `klines` | SQL table name |
-| `-b, --batch-size` | `250000` | Rows per transaction commit |
+| `-b, --batch-size` | `250000` | Commit every N rows (only used in safe mode) |
 | `--progress-every` | `1000000` | Print progress every N rows |
 | `--has-header` | `false` | CSV has header row |
-| `--recreate` | `false` | Delete DB/WAL/SHM files and recreate from scratch |
-| `--recreate-pragmatic` | `false` | Delete DB file family only when this is the only user table; otherwise drop this table, vacuum, and truncate WAL |
-| `--import-mode` | `balanced` | Durability mode: safe/balanced/unsafe |
-| `--replace-existing` | `false` | Replace duplicates vs skip |
+| `--recreate` | `false` | Delete DB file and recreate from scratch |
+| `--recreate-pragmatic` | `false` | Delete DB file only when this is the only user table; otherwise drop this table, vacuum, and checkpoint |
+| `--import-mode` | `balanced` | Insert strategy: safe (prepared stmts), balanced (Appender+flush), unsafe (Appender) |
+| `--replace-existing` | `false` | Replace duplicates vs skip (forces prepared-statement mode) |
 | `--skip-order-check` | `false` | Allow non-increasing open_time |
 | `--auto` | none | Import only the newest N matching CSV files per job |
 | `--all` | `false` | Recursively import every CSV directory; defaults become `--dir ../data/` and `--db ../db/` |
 | `--jobs` | `1` | Number of CSV directories to process in parallel with `--all` |
 
+### Import Modes
+
+| Mode | Strategy | Best for |
+|------|----------|----------|
+| `safe` | Row-by-row prepared statements with periodic `COMMIT` | Maximum crash safety |
+| `balanced` (default) | DuckDB Appender with periodic `flush()` calls | Good performance + durability |
+| `unsafe` | DuckDB Appender with auto flush only at end | Maximum throughput |
+
+When `--replace-existing` is set, the tool falls back to prepared statements (INSERT OR REPLACE) regardless of import mode, since Appender does not support ON CONFLICT.
+
 ### Verification
 
 ```bash
 # List tables
-tursodb --readonly --experimental-views ../db/BTCUSDT/BTCUSDT.db '.tables'
+duckdb ../db/BTCUSDT/BTCUSDT.duckdb '.tables'
 
 # Count rows
-tursodb --readonly --experimental-views ../db/BTCUSDT/BTCUSDT.db 'SELECT COUNT(*) FROM klines;'
+duckdb ../db/BTCUSDT/BTCUSDT.duckdb 'SELECT COUNT(*) FROM klines;'
 
 # Example --all output
-tursodb --readonly --experimental-views ../db/ETHUSDT/ETHUSDT.db 'SELECT COUNT(*) FROM klines;'
+duckdb ../db/ETHUSDT/ETHUSDT.duckdb 'SELECT COUNT(*) FROM klines;'
+
+# Check time range
+duckdb ../db/BTCUSDT/BTCUSDT.duckdb 'SELECT MIN(open_time), MAX(open_time) FROM klines;'
 ```
 
 ## File Naming Convention
@@ -91,32 +100,31 @@ Examples:
 
 ```sql
 CREATE TABLE klines (
-    open_time INTEGER NOT NULL,
-    open REAL NOT NULL,
-    high REAL NOT NULL,
-    low REAL NOT NULL,
-    close REAL NOT NULL,
-    volume REAL NOT NULL,
-    close_time INTEGER NOT NULL,
-    quote_asset_volume REAL NOT NULL,
-    number_of_trades INTEGER NOT NULL,
-    taker_buy_base_asset_volume REAL NOT NULL,
-    taker_buy_quote_asset_volume REAL NOT NULL,
-    ignore_col TEXT,
-    rsi_1 REAL,           -- Optional RSI columns inferred from CSV
-    rsi_2 REAL,
-    rsi_3 REAL,
+    open_time BIGINT NOT NULL,
+    open DOUBLE NOT NULL,
+    high DOUBLE NOT NULL,
+    low DOUBLE NOT NULL,
+    close DOUBLE NOT NULL,
+    volume DOUBLE NOT NULL,
+    close_time BIGINT NOT NULL,
+    quote_asset_volume DOUBLE NOT NULL,
+    number_of_trades BIGINT NOT NULL,
+    taker_buy_base_asset_volume DOUBLE NOT NULL,
+    taker_buy_quote_asset_volume DOUBLE NOT NULL,
+    ignore_col VARCHAR,
+    rsi_1 DOUBLE,           -- Optional RSI columns inferred from CSV
+    rsi_2 DOUBLE,
+    rsi_3 DOUBLE,
     PRIMARY KEY (open_time)
 );
 ```
 
 ## Key Implementation Details
 
-### Turso Compatibility Quirks
+### Insert Strategies
 
-1. **PRAGMA returns rows**: `PRAGMA journal_mode = WAL` returns a row, must use `conn.query()` not `conn.execute()`.
-2. **No WITHOUT ROWID**: Turso 0.5.3 does not support `WITHOUT ROWID` tables - creates standard tables only.
-3. **WAL checkpoint returns rows**: `PRAGMA wal_checkpoint(TRUNCATE)` returns rows, so consume it with `query()`.
+1. **Appender path** (balanced/unsafe): Uses DuckDB's native `Appender` API for columnar bulk inserts. Much faster than row-by-row prepared statements. The `--replace-existing` flag forces prepared statements since Appender lacks ON CONFLICT support.
+2. **Prepared statement path** (safe): Uses `INSERT OR IGNORE`/`INSERT OR REPLACE` with DuckDB prepared statements. Periodic `BEGIN`/`COMMIT` at `--batch-size` intervals.
 
 ### Progress Bar
 
@@ -127,14 +135,15 @@ CREATE TABLE klines (
 ### Resume/Skip Logic
 
 1. **open_time skip**: Rows with `open_time` <= DB max are skipped
-2. **Conflict mode**: Uses `INSERT OR IGNORE` by default; set `--replace-existing` for `INSERT OR REPLACE`
+2. **Conflict mode**: Uses `INSERT OR IGNORE` by default in safe mode; Appender path filters by resume_open_time
+3. **set `--replace-existing`**: Uses `INSERT OR REPLACE` (forces prepared-statement path)
 
 ### File Processing
 
 - Single-import files are discovered by interval, with the symbol inferred from CSV filenames
-- `--all` recursively discovers every directory with valid CSVs and mirrors its relative path under the output root
+- `--all` recursively discovers every directory with valid CSVs and mirrors its relative path under the output root, creating one `{symbol}.duckdb` database per CSV file group
 - `--all` requires each CSV directory to contain one symbol and one interval
-- `--jobs` controls how many `--all` CSV directories are imported in parallel; files inside each directory remain sequential
+- `--jobs` controls how many `--all` CSV directories are imported in parallel using `std::thread`; files inside each directory remain sequential
 - Sorted by year-month order
 - Two-pass scan: first collects file stats (row count, last open_time), then imports
 - Column inference: first row determines RSI column count from extra CSV columns
@@ -152,12 +161,12 @@ const PROGRESS_FLUSH_ROWS: u64 = 8192;  // Progress bar update batch size
 |----------|---------|
 | `build_import_jobs()` | Build one import job or all mirrored recursive import jobs |
 | `create_table()` | Create klines table with inferred RSI columns |
-| `import_file()` | Import single CSV file with batching |
+| `import_file_with_appender()` | Import single CSV file using DuckDB Appender API |
+| `import_file_with_prepared_stmt()` | Import single CSV file using prepared statements |
 | `max_open_time()` | Get max open_time from DB for resume |
-| `determine_recreate_action()` | Choose full file deletion vs table-only pragmatic recreation |
-| `remove_database_files()` | Delete DB, WAL, and SHM files for full recreation |
-| `apply_journal_mode()` | Set WAL mode (query-based workaround) |
-| `apply_wal_checkpoint_truncate()` | Flush DB changes and truncate WAL with row-consuming PRAGMA handling |
+| `determine_recreate_action()` | Choose full file deletion vs table-only recreation |
+| `remove_database_files()` | Delete DB file for full recreation |
+| `apply_import_mode()` | Set synchronous PRAGMA for durability/speed tradeoff |
 
 ## Testing
 
@@ -185,6 +194,8 @@ cargo run --release -- --all --jobs 4
 
 1. **Never commit secrets**: Don't add API keys, credentials, or secrets to the repo
 2. **Preserve terminating newlines**: Ensure `Cargo.toml` and `src/main.rs` end with a newline
-3. **Turso 0.5.3 limitations**: No encryption, no WITHOUT ROWID, experimental features need flags
-4. **Large imports**: For 100M+ rows, use `--import-mode balanced` (default) - safe but fast
-5. **View inspection**: Always use `--experimental-views` flag with tursodb when querying views
+3. **DuckDB bundled**: Uses `bundled` feature which compiles DuckDB from source on first build
+4. **Large imports**: Appender mode (balanced/unsafe) is significantly faster for 100M+ rows
+5. **View inspection**: Use `duckdb` CLI directly.
+6. **Sync API**: DuckDB uses a fully synchronous Rust API
+7. **Thread safety**: `--jobs N` uses `std::thread` with a shared `ProgressUi` (Arc). ProgressBar handles are cloned, not moved.
