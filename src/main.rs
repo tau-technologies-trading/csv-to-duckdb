@@ -451,8 +451,6 @@ fn run_import_job(args: &Args, mut job: ImportJob, progress_ui: Arc<ProgressUi>)
     let conn = Connection::open(&db_path)
         .with_context(|| format!("Cannot open DuckDB database at {}", db_path))?;
 
-    apply_import_mode(&conn, args.import_mode)?;
-
     if recreate_action == RecreateAction::DropTableOnly {
         conn.execute_batch(&format!("DROP TABLE IF EXISTS {}", args.table))?;
         conn.execute_batch("CHECKPOINT")?;
@@ -926,22 +924,6 @@ fn remove_database_files(db_path: &str) -> Result<()> {
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
         Err(err) => {
             return Err(err).with_context(|| format!("Cannot remove {}", db_path));
-        }
-    }
-
-    Ok(())
-}
-
-fn apply_import_mode(conn: &Connection, mode: ImportMode) -> Result<()> {
-    match mode {
-        ImportMode::Safe => {
-            conn.execute_batch("PRAGMA synchronous = FULL")?;
-        }
-        ImportMode::Balanced => {
-            conn.execute_batch("PRAGMA synchronous = NORMAL")?;
-        }
-        ImportMode::Unsafe => {
-            conn.execute_batch("PRAGMA synchronous = OFF")?;
         }
     }
 
