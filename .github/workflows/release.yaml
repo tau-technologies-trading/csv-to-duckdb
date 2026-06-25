@@ -20,28 +20,28 @@ jobs:
         include:
           - target: x86_64-unknown-linux-gnu
             runner: blacksmith-4vcpu-ubuntu-2404
-            binary: csv-to-turso
+            binary: csv-to-duckdb
 
           - target: aarch64-unknown-linux-gnu
             runner: blacksmith-4vcpu-ubuntu-2404-arm
-            binary: csv-to-turso
+            binary: csv-to-duckdb
 
           - target: x86_64-apple-darwin
             runner: blacksmith-6vcpu-macos-15
-            binary: csv-to-turso
+            binary: csv-to-duckdb
 
           - target: aarch64-apple-darwin
             runner: blacksmith-6vcpu-macos-15
-            binary: csv-to-turso
+            binary: csv-to-duckdb
 
           - target: x86_64-pc-windows-msvc
             runner: blacksmith-4vcpu-ubuntu-2404
-            binary: csv-to-turso.exe
+            binary: csv-to-duckdb.exe
             xwin: true
 
           - target: aarch64-pc-windows-msvc
             runner: blacksmith-4vcpu-ubuntu-2404
-            binary: csv-to-turso.exe
+            binary: csv-to-duckdb.exe
             xwin: true
 
     steps:
@@ -71,7 +71,7 @@ jobs:
       - name: Upload binary
         uses: actions/upload-artifact@v7.0.1
         with:
-          name: csv-to-turso-${{ matrix.target }}
+          name: csv-to-duckdb-${{ matrix.target }}
           path: target/${{ matrix.target }}/release/${{ matrix.binary }}
           if-no-files-found: error
 
@@ -133,28 +133,28 @@ jobs:
           ]
 
           for target in unix_targets:
-              source = Path("artifacts") / f"csv-to-turso-{target}" / "csv-to-turso"
-              archive = dist / f"csv-to-turso-{tag}-{target}.tar.gz"
+              source = Path("artifacts") / f"csv-to-duckdb-{target}" / "csv-to-duckdb"
+              archive = dist / f"csv-to-duckdb-{tag}-{target}.tar.gz"
 
               if not source.exists():
                   raise FileNotFoundError(source)
 
               with tarfile.open(archive, "w:gz") as tar:
-                  info = tar.gettarinfo(source, arcname="csv-to-turso")
+                  info = tar.gettarinfo(source, arcname="csv-to-duckdb")
                   info.mode = 0o755
 
                   with source.open("rb") as binary:
                       tar.addfile(info, binary)
 
           for target in windows_targets:
-              source = Path("artifacts") / f"csv-to-turso-{target}" / "csv-to-turso.exe"
-              archive = dist / f"csv-to-turso-{tag}-{target}.zip"
+              source = Path("artifacts") / f"csv-to-duckdb-{target}" / "csv-to-duckdb.exe"
+              archive = dist / f"csv-to-duckdb-{tag}-{target}.zip"
 
               if not source.exists():
                   raise FileNotFoundError(source)
 
               with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as zip_file:
-                  zip_file.write(source, arcname="csv-to-turso.exe")
+                  zip_file.write(source, arcname="csv-to-duckdb.exe")
           PY
 
       - name: Generate release notes
