@@ -1,7 +1,7 @@
 use anyhow::{Context, Result, bail};
 use clap::{Parser, ValueEnum};
 use csv::{ReaderBuilder, StringRecord};
-use duckdb::{Appender, Connection, appender_params_from_iter, types::ToSql};
+use duckdb::{Appender, Connection, appender_params_from_iter, params, types::ToSql};
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader};
@@ -16,6 +16,9 @@ const DEFAULT_SINGLE_DIR: &str = "../data/BTCUSDT/";
 const DEFAULT_SINGLE_DB: &str = "../db/BTCUSDT/BTCUSDT.duckdb";
 const DEFAULT_ALL_DIR: &str = "../data/";
 const DEFAULT_ALL_DB_DIR: &str = "../db/";
+const DEFAULT_ONE_FILE_DB: &str = "../db/klines.duckdb";
+const METADATA_TABLE: &str = "symbol_columns";
+const STAGING_TABLE: &str = "__csv_to_duckdb_staging";
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum ImportMode {
@@ -39,10 +42,10 @@ enum RecreateAction {
 #[derive(Parser, Debug)]
 #[command(
     about = "Import Binance Vision CSV files into a local DuckDB database",
-    long_about = "Import Binance Vision CSV files into local DuckDB databases.\n\nProvide at least one option. The default single-symbol import reads matching files like BTCUSDT-1s-2026-04.csv from ../data/BTCUSDT/, creates ../db/BTCUSDT/BTCUSDT.duckdb, and imports rows into klines. With --all, it scans ../data/ recursively and mirrors every CSV directory under ../db/, creating one {symbol}.duckdb database for each CSV file group. Existing rows are skipped by default so interrupted imports can resume safely. Use --auto N for the newest N files, --recreate to rebuild from scratch, --recreate-pragmatic to rebuild only this table when other user tables exist, and --replace-existing to overwrite duplicate primary keys. Import mode controls the insert path: safe uses row-by-row prepared statements, balanced uses DuckDB's Appender with periodic flushes, and unsafe uses the Appender with minimal flushing.",
+    long_about = "Import Binance Vision CSV files into local DuckDB databases.\n\nProvide at least one option. The default single-symbol import reads matching files like BTCUSDT-1s-2026-04.csv from ../data/BTCUSDT/, creates ../db/BTCUSDT/BTCUSDT.duckdb, and imports rows into klines. With --multiple-files, it scans ../data/ recursively and mirrors every CSV directory under ../db/, creating one {symbol}.duckdb database for each CSV file group. With --one-file, it scans ../data/ recursively and creates one wide time-aligned DuckDB table plus a metadata DuckDB file mapping each currency to its actual table column range. Existing rows are skipped by default in row-oriented imports so interrupted imports can resume safely. Use --auto N for the newest N files, --recreate to rebuild from scratch, --recreate-pragmatic to rebuild only this table when other user tables exist, and --replace-existing to overwrite duplicate primary keys. Import mode controls the row-oriented insert path: safe uses row-by-row prepared statements, balanced uses DuckDB's Appender with periodic flushes, and unsafe uses the Appender with minimal flushing.",
     version,
     disable_version_flag = true,
-    after_help = "Examples:\n  csv-to-duckdb --auto 3\n  csv-to-duckdb -o ../db/BTCUSDT/BTCUSDT.duckdb --recreate\n  csv-to-duckdb --all\n  csv-to-duckdb --all --jobs 4\n  csv-to-duckdb --all -d ../data/ -o ../db/ --recreate-pragmatic\n  csv-to-duckdb --import-mode unsafe --batch-size 500000\n  csv-to-duckdb --has-header --replace-existing\n  csv-to-duckdb -d ../data/ETHUSDT --db ../db/ETHUSDT/ETHUSDT.duckdb --interval 1m --table eth_klines\n\nVerification:\n  duckdb ../db/BTCUSDT/BTCUSDT.duckdb 'SELECT COUNT(*) FROM klines;'\n  duckdb ../db/BTCUSDT/BTCUSDT.duckdb 'SELECT MIN(open_time), MAX(open_time) FROM klines;'\n\nNotes:\n  At least one option is required; run --auto, --all, --recreate, or an explicit path option to import.\n  Defaults: --dir ../data/BTCUSDT/, --db ../db/BTCUSDT/BTCUSDT.duckdb, --interval 1s, --table klines.\n  With --all and unchanged defaults: --dir ../data/, --db ../db/.\n  Each CSV directory/file group is imported into its own {symbol}.duckdb database.\n  Files must follow SYMBOL-INTERVAL-YYYY-MM.csv; symbols are inferred from filenames.\n  Imports the 12 Binance Vision kline columns plus any extra RSI columns.\n  Import modes: safe (prepared statements), balanced (Appender + periodic flushes), unsafe (Appender + minimal flushing).\n  --replace-existing forces prepared-statement inserts because DuckDB Appender does not support conflict handling."
+    after_help = "Examples:\n  csv-to-duckdb --auto 3\n  csv-to-duckdb -o ../db/BTCUSDT/BTCUSDT.duckdb --recreate\n  csv-to-duckdb --one-file\n  csv-to-duckdb --one-file -d ../data/ -o ../db/klines.duckdb --recreate\n  csv-to-duckdb --multiple-files\n  csv-to-duckdb --multiple-files --jobs 4\n  csv-to-duckdb --multiple-files -d ../data/ -o ../db/ --recreate-pragmatic\n  csv-to-duckdb --import-mode unsafe --batch-size 500000\n  csv-to-duckdb --has-header --replace-existing\n  csv-to-duckdb -d ../data/ETHUSDT --db ../db/ETHUSDT/ETHUSDT.duckdb --interval 1m --table eth_klines\n\nVerification:\n  duckdb ../db/BTCUSDT/BTCUSDT.duckdb 'SELECT COUNT(*) FROM klines;'\n  duckdb ../db/klines_metadata.duckdb 'SELECT * FROM symbol_columns;'\n\nNotes:\n  At least one option is required; run --auto, --one-file, --multiple-files, --recreate, or an explicit path option to import.\n  Defaults: --dir ../data/BTCUSDT/, --db ../db/BTCUSDT/BTCUSDT.duckdb, --interval 1s, --table klines.\n  With --one-file and unchanged defaults: --dir ../data/, --db ../db/klines.duckdb.\n  With --multiple-files and unchanged defaults: --dir ../data/, --db ../db/.\n  --one-file creates a wide table aligned by open_time and a metadata DB named like *_metadata.duckdb.\n  --multiple-files imports each CSV directory/file group into its own {symbol}.duckdb database.\n  Files must follow SYMBOL-INTERVAL-YYYY-MM.csv; symbols are inferred from filenames.\n  Imports the 12 Binance Vision kline columns plus any extra RSI columns.\n  Import modes: safe (prepared statements), balanced (Appender + periodic flushes), unsafe (Appender + minimal flushing).\n  --replace-existing forces prepared-statement inserts because DuckDB Appender does not support conflict handling."
 )]
 #[derive(Clone)]
 struct Args {
@@ -50,7 +53,7 @@ struct Args {
     #[arg(short, long, default_value = DEFAULT_SINGLE_DIR)]
     dir: PathBuf,
 
-    /// Output DuckDB database path, or output root directory with --all
+    /// Output DuckDB database path, or output root directory with --multiple-files
     #[arg(short = 'o', long, default_value = DEFAULT_SINGLE_DB)]
     db: String,
 
@@ -98,11 +101,19 @@ struct Args {
     #[arg(long)]
     auto: Option<usize>,
 
-    /// Recursively import every CSV directory and mirror the directory structure
-    #[arg(long, default_value_t = false)]
+    /// Hidden compatibility alias for --one-file
+    #[arg(long, default_value_t = false, hide = true)]
     all: bool,
 
-    /// Number of CSV directories to process in parallel with --all
+    /// Recursively import every CSV directory into one wide time-aligned database
+    #[arg(long, default_value_t = false)]
+    one_file: bool,
+
+    /// Recursively import every CSV directory into mirrored per-symbol databases
+    #[arg(long, default_value_t = false)]
+    multiple_files: bool,
+
+    /// Number of CSV directories to process in parallel with --multiple-files
     #[arg(long, default_value_t = 1)]
     jobs: usize,
 
@@ -145,6 +156,13 @@ struct ImportJob {
     symbol: String,
     interval: String,
     files: Vec<CsvFile>,
+}
+
+struct SymbolMetadata {
+    symbol: String,
+    start_column: usize,
+    end_column: usize,
+    first_open_time: i64,
 }
 
 struct ProgressUi {
@@ -327,7 +345,15 @@ fn main() -> Result<()> {
     validate_ident(&args.table)?;
 
     let mut args = args;
-    if args.all {
+    if one_file_requested(&args) && args.jobs > 1 {
+        eprintln!(
+            "Warning: --one-file writes to a single DuckDB file; --jobs {} capped to 1",
+            args.jobs
+        );
+        args.jobs = 1;
+    }
+
+    if args.multiple_files {
         let cpus = thread::available_parallelism()
             .map(|n| n.get())
             .unwrap_or(1);
@@ -341,8 +367,10 @@ fn main() -> Result<()> {
         }
     }
 
-    let jobs = build_import_jobs(&args, dir_arg_provided, db_arg_provided)?;
-    if args.all {
+    if one_file_requested(&args) {
+        run_one_file_import(&args, dir_arg_provided, db_arg_provided)?;
+    } else if args.multiple_files {
+        let jobs = build_import_jobs(&args, dir_arg_provided, db_arg_provided)?;
         let max_parallel = args.jobs.min(jobs.len());
         println!(
             "Found {} import job(s). Processing up to {} folder(s) in parallel.",
@@ -351,6 +379,7 @@ fn main() -> Result<()> {
         );
         run_all_import_jobs(args, jobs)?;
     } else {
+        let jobs = build_import_jobs(&args, dir_arg_provided, db_arg_provided)?;
         let progress_ui = ProgressUi::new();
         for job in jobs {
             run_import_job(&args, job, Arc::clone(&progress_ui))?;
@@ -358,6 +387,10 @@ fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+fn one_file_requested(args: &Args) -> bool {
+    args.one_file || args.all
 }
 
 fn run_all_import_jobs(args: Args, jobs: Vec<ImportJob>) -> Result<()> {
@@ -389,6 +422,208 @@ fn run_all_import_jobs(args: Args, jobs: Vec<ImportJob>) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn run_one_file_import(args: &Args, dir_arg_provided: bool, db_arg_provided: bool) -> Result<()> {
+    let dir = if dir_arg_provided {
+        args.dir.clone()
+    } else {
+        PathBuf::from(DEFAULT_ALL_DIR)
+    };
+    let db_path = if db_arg_provided {
+        PathBuf::from(&args.db)
+    } else {
+        PathBuf::from(DEFAULT_ONE_FILE_DB)
+    };
+    let metadata_path = metadata_db_path(&db_path);
+
+    let mut jobs = discover_one_file_import_jobs(&dir)?;
+    jobs.sort_by(|a, b| a.symbol.cmp(&b.symbol).then_with(|| a.dir.cmp(&b.dir)));
+    ensure_unique_symbols(&jobs)?;
+    ensure_single_interval(&jobs)?;
+
+    if let Some(parent) = db_path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("Cannot create {}", parent.display()))?;
+    }
+    if let Some(parent) = metadata_path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("Cannot create {}", parent.display()))?;
+    }
+
+    let db_path_str = db_path.to_string_lossy().to_string();
+    let metadata_path_str = metadata_path.to_string_lossy().to_string();
+    let recreate_action = determine_recreate_action(args, &db_path_str)?;
+    if recreate_action == RecreateAction::DeleteDatabaseFiles {
+        remove_database_files(&db_path_str)?;
+        remove_database_files(&metadata_path_str)?;
+    }
+
+    let conn = Connection::open(&db_path)
+        .with_context(|| format!("Cannot open DuckDB database at {}", db_path.display()))?;
+    let metadata_conn = Connection::open(&metadata_path).with_context(|| {
+        format!(
+            "Cannot open DuckDB metadata database at {}",
+            metadata_path.display()
+        )
+    })?;
+
+    if recreate_action == RecreateAction::DropTableOnly {
+        conn.execute_batch(&format!(
+            "DROP TABLE IF EXISTS {}",
+            quote_ident(&args.table)
+        ))?;
+        conn.execute_batch("CHECKPOINT")?;
+        conn.execute_batch("VACUUM")?;
+        conn.execute_batch("CHECKPOINT")?;
+        metadata_conn.execute_batch(&format!(
+            "DROP TABLE IF EXISTS {}",
+            quote_ident(METADATA_TABLE)
+        ))?;
+        metadata_conn.execute_batch("CHECKPOINT")?;
+    }
+
+    create_wide_table(&conn, &args.table)?;
+    create_metadata_table(&metadata_conn)?;
+
+    let progress_ui = ProgressUi::new();
+    progress_ui.println(format!(
+        "Importing {} symbol(s) from {} into one wide DB {}",
+        jobs.len(),
+        dir.display(),
+        db_path.display()
+    ));
+    progress_ui.println(format!(
+        "Writing metadata into {} table {}",
+        metadata_path.display(),
+        METADATA_TABLE
+    ));
+
+    for mut job in jobs {
+        job.files.sort_by_key(|f| (f.year, f.month, f.path.clone()));
+        apply_auto_file_limit(&mut job.files, args.auto);
+
+        if job.files.is_empty() {
+            continue;
+        }
+
+        if metadata_has_symbol(&metadata_conn, &job.symbol)? {
+            progress_ui.println(format!(
+                "Skipping {} because it already exists in metadata; use --recreate to rebuild",
+                job.symbol
+            ));
+            continue;
+        }
+
+        warn_missing_months(&job.files, &progress_ui);
+        let rsi_count = infer_max_rsi_columns(&job.files, args.has_header)?;
+        let file_stats = collect_file_stats(&job.files, args.has_header)?;
+        let expected_rows = file_stats
+            .iter()
+            .map(|stats| stats.row_count)
+            .sum::<usize>();
+
+        progress_ui.println(format!(
+            "Staging {} {} from {} ({} file(s), {} expected row(s), {} RSI column(s))",
+            job.symbol,
+            job.interval,
+            job.dir.display(),
+            job.files.len(),
+            expected_rows,
+            rsi_count
+        ));
+
+        create_staging_table(&conn, rsi_count)?;
+        let staged_rows = import_symbol_to_staging(
+            &conn,
+            args,
+            &job,
+            rsi_count,
+            &file_stats,
+            Arc::clone(&progress_ui),
+        )?;
+
+        if staged_rows == 0 {
+            drop_staging_table(&conn)?;
+            progress_ui.println(format!(
+                "Skipping {} because no rows were staged",
+                job.symbol
+            ));
+            continue;
+        }
+
+        let metadata = merge_staging_into_wide_table(&conn, &args.table, &job.symbol, rsi_count)?;
+        insert_symbol_metadata(&metadata_conn, &metadata)?;
+        drop_staging_table(&conn)?;
+
+        progress_ui.println(format!(
+            "Mapped {} to columns {}-{} (first_open_time={})",
+            metadata.symbol, metadata.start_column, metadata.end_column, metadata.first_open_time
+        ));
+    }
+
+    conn.execute_batch("CHECKPOINT")?;
+    metadata_conn.execute_batch("CHECKPOINT")?;
+    progress_ui.println("Done. One-file import complete.");
+
+    Ok(())
+}
+
+fn discover_one_file_import_jobs(dir: &Path) -> Result<Vec<ImportJob>> {
+    let mut jobs = Vec::new();
+    collect_all_import_jobs(dir, dir, Path::new("."), &mut jobs)?;
+    if jobs.is_empty() {
+        bail!("No CSV directories found in {}", dir.display());
+    }
+    Ok(jobs)
+}
+
+fn ensure_unique_symbols(jobs: &[ImportJob]) -> Result<()> {
+    for pair in jobs.windows(2) {
+        if pair[0].symbol == pair[1].symbol {
+            bail!(
+                "Duplicate symbol {} found in both {} and {}; --one-file requires one CSV directory per symbol",
+                pair[0].symbol,
+                pair[0].dir.display(),
+                pair[1].dir.display()
+            );
+        }
+    }
+    Ok(())
+}
+
+fn ensure_single_interval(jobs: &[ImportJob]) -> Result<()> {
+    let Some(first) = jobs.first() else {
+        return Ok(());
+    };
+
+    for job in &jobs[1..] {
+        if job.interval != first.interval {
+            bail!(
+                "Mixed intervals are not supported with --one-file: found both {} in {} and {} in {}",
+                first.interval,
+                first.dir.display(),
+                job.interval,
+                job.dir.display()
+            );
+        }
+    }
+
+    Ok(())
+}
+
+fn metadata_db_path(db_path: &Path) -> PathBuf {
+    let parent = db_path.parent().unwrap_or_else(|| Path::new(""));
+    let stem = db_path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("metadata");
+    let extension = db_path
+        .extension()
+        .and_then(|s| s.to_str())
+        .unwrap_or("duckdb");
+
+    parent.join(format!("{}_metadata.{}", stem, extension))
 }
 
 fn run_import_job(args: &Args, mut job: ImportJob, progress_ui: Arc<ProgressUi>) -> Result<()> {
@@ -631,6 +866,14 @@ fn arg_was_provided(short: &str, long: &str) -> bool {
 }
 
 fn validate_args(args: &Args) -> Result<()> {
+    if one_file_requested(args) && args.multiple_files {
+        bail!("--one-file and --multiple-files cannot be used together");
+    }
+
+    if one_file_requested(args) && args.replace_existing {
+        bail!("--replace-existing is not supported with --one-file; use --recreate instead");
+    }
+
     if args.batch_size == 0 {
         bail!("--batch-size must be greater than 0");
     }
@@ -663,7 +906,7 @@ fn build_import_jobs(
     dir_arg_provided: bool,
     db_arg_provided: bool,
 ) -> Result<Vec<ImportJob>> {
-    if args.all {
+    if args.multiple_files {
         let dir = if dir_arg_provided {
             args.dir.clone()
         } else {
@@ -1129,6 +1372,260 @@ fn create_table(conn: &Connection, table: &str, rsi_count: usize) -> Result<()> 
 
     conn.execute_batch(&sql)?;
     Ok(())
+}
+
+fn create_wide_table(conn: &Connection, table: &str) -> Result<()> {
+    let sql = format!(
+        "CREATE TABLE IF NOT EXISTS {} (open_time BIGINT PRIMARY KEY)",
+        quote_ident(table)
+    );
+    conn.execute_batch(&sql)?;
+    Ok(())
+}
+
+fn create_metadata_table(conn: &Connection) -> Result<()> {
+    let sql = format!(
+        "CREATE TABLE IF NOT EXISTS {} (currency VARCHAR NOT NULL PRIMARY KEY, start_column INTEGER NOT NULL, end_column INTEGER NOT NULL, first_open_time BIGINT NOT NULL)",
+        quote_ident(METADATA_TABLE)
+    );
+    conn.execute_batch(&sql)?;
+    Ok(())
+}
+
+fn create_staging_table(conn: &Connection, rsi_count: usize) -> Result<()> {
+    drop_staging_table(conn)?;
+
+    let mut cols = vec![
+        "open_time BIGINT NOT NULL".to_string(),
+        "open DOUBLE".to_string(),
+        "high DOUBLE".to_string(),
+        "low DOUBLE".to_string(),
+        "close DOUBLE".to_string(),
+        "volume DOUBLE".to_string(),
+        "close_time BIGINT".to_string(),
+        "quote_asset_volume DOUBLE".to_string(),
+        "number_of_trades BIGINT".to_string(),
+        "taker_buy_base_asset_volume DOUBLE".to_string(),
+        "taker_buy_quote_asset_volume DOUBLE".to_string(),
+        "ignore_col VARCHAR".to_string(),
+    ];
+
+    for i in 1..=rsi_count {
+        cols.push(format!("rsi_{} DOUBLE", i));
+    }
+
+    cols.push("PRIMARY KEY (open_time)".to_string());
+
+    let sql = format!(
+        "CREATE TABLE {} ({})",
+        quote_ident(STAGING_TABLE),
+        cols.join(", ")
+    );
+    conn.execute_batch(&sql)?;
+    Ok(())
+}
+
+fn drop_staging_table(conn: &Connection) -> Result<()> {
+    conn.execute_batch(&format!(
+        "DROP TABLE IF EXISTS {}",
+        quote_ident(STAGING_TABLE)
+    ))?;
+    Ok(())
+}
+
+fn import_symbol_to_staging(
+    conn: &Connection,
+    args: &Args,
+    job: &ImportJob,
+    rsi_count: usize,
+    file_stats: &[FileStats],
+    progress_ui: Arc<ProgressUi>,
+) -> Result<usize> {
+    let mut appender = conn
+        .appender(STAGING_TABLE)
+        .with_context(|| format!("Cannot create Appender for table {}", STAGING_TABLE))?;
+    let start = Instant::now();
+    let expected_rows = file_stats
+        .iter()
+        .map(|stats| stats.row_count)
+        .sum::<usize>();
+    let mut progress = progress_ui.start_job(&job.symbol, Some(expected_rows as u64));
+    let mut total_rows = 0usize;
+    let mut last_open_time = None;
+
+    for (file, stats) in job.files.iter().zip(file_stats.iter()) {
+        let file_name = file.path.file_name().unwrap().to_string_lossy().to_string();
+        let mut progress_slot = progress.acquire_slot(&file_name, Some(stats.row_count as u64));
+        let imported = import_file_with_appender(
+            file,
+            args,
+            rsi_count,
+            &mut appender,
+            conn,
+            &mut total_rows,
+            &mut last_open_time,
+            start,
+            &progress_slot,
+            None,
+        )?;
+        progress_slot.finish();
+        progress.println(format!("Staged {:>12} rows from {}", imported, file_name));
+    }
+
+    appender.flush()?;
+    progress.finish();
+
+    Ok(total_rows)
+}
+
+fn merge_staging_into_wide_table(
+    conn: &Connection,
+    table: &str,
+    symbol: &str,
+    rsi_count: usize,
+) -> Result<SymbolMetadata> {
+    let first_open_time = min_open_time(conn, STAGING_TABLE)?
+        .with_context(|| format!("No staged rows found for {}", symbol))?;
+    let start_column = table_column_count(conn, table)? + 1;
+    let data_columns = data_column_specs(rsi_count);
+    let main_columns = symbol_data_column_names(symbol, rsi_count)?;
+
+    for ((_, sql_type), column_name) in data_columns.iter().zip(main_columns.iter()) {
+        let sql = format!(
+            "ALTER TABLE {} ADD COLUMN {} {}",
+            quote_ident(table),
+            quote_ident(column_name),
+            sql_type
+        );
+        conn.execute_batch(&sql)?;
+    }
+
+    conn.execute_batch(&format!(
+        "INSERT OR IGNORE INTO {} (open_time) SELECT open_time FROM {}",
+        quote_ident(table),
+        quote_ident(STAGING_TABLE)
+    ))?;
+
+    let assignments = data_columns
+        .iter()
+        .zip(main_columns.iter())
+        .map(|((source_name, _), target_name)| {
+            format!(
+                "{} = s.{}",
+                quote_ident(target_name),
+                quote_ident(source_name)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let update_sql = format!(
+        "UPDATE {} AS k SET {} FROM {} AS s WHERE k.open_time = s.open_time",
+        quote_ident(table),
+        assignments,
+        quote_ident(STAGING_TABLE)
+    );
+    conn.execute_batch(&update_sql)?;
+
+    Ok(SymbolMetadata {
+        symbol: symbol.to_string(),
+        start_column,
+        end_column: start_column + main_columns.len() - 1,
+        first_open_time,
+    })
+}
+
+fn insert_symbol_metadata(conn: &Connection, metadata: &SymbolMetadata) -> Result<()> {
+    let sql = format!(
+        "INSERT INTO {} (currency, start_column, end_column, first_open_time) VALUES (?1, ?2, ?3, ?4)",
+        quote_ident(METADATA_TABLE)
+    );
+    conn.execute(
+        &sql,
+        params![
+            metadata.symbol,
+            metadata.start_column as i64,
+            metadata.end_column as i64,
+            metadata.first_open_time
+        ],
+    )?;
+    Ok(())
+}
+
+fn metadata_has_symbol(conn: &Connection, symbol: &str) -> Result<bool> {
+    let sql = format!(
+        "SELECT COUNT(*) FROM {} WHERE currency = ?1",
+        quote_ident(METADATA_TABLE)
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let mut rows = stmt.query_map(params![symbol], |row| row.get::<_, i64>(0))?;
+    match rows.next() {
+        Some(Ok(count)) => Ok(count > 0),
+        Some(Err(err)) => Err(anyhow::anyhow!("Failed to read metadata: {}", err)),
+        None => Ok(false),
+    }
+}
+
+fn min_open_time(conn: &Connection, table: &str) -> Result<Option<i64>> {
+    let sql = format!("SELECT MIN(open_time) FROM {}", quote_ident(table));
+    let mut stmt = conn.prepare(&sql)?;
+    let mut rows = stmt.query_map([], |row| row.get::<_, Option<i64>>(0))?;
+    match rows.next() {
+        Some(Ok(open_time)) => Ok(open_time),
+        Some(Err(err)) => Err(anyhow::anyhow!("Failed to read MIN(open_time): {}", err)),
+        None => Ok(None),
+    }
+}
+
+fn table_column_count(conn: &Connection, table: &str) -> Result<usize> {
+    let sql = format!(
+        "SELECT COUNT(*) FROM pragma_table_info('{}')",
+        escape_sql_string(table)
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let mut rows = stmt.query_map([], |row| row.get::<_, i64>(0))?;
+    match rows.next() {
+        Some(Ok(count)) => Ok(count as usize),
+        Some(Err(err)) => Err(anyhow::anyhow!("Failed to count table columns: {}", err)),
+        None => Ok(0),
+    }
+}
+
+fn data_column_specs(rsi_count: usize) -> Vec<(String, &'static str)> {
+    let mut cols = vec![
+        ("open".to_string(), "DOUBLE"),
+        ("high".to_string(), "DOUBLE"),
+        ("low".to_string(), "DOUBLE"),
+        ("close".to_string(), "DOUBLE"),
+        ("volume".to_string(), "DOUBLE"),
+        ("close_time".to_string(), "BIGINT"),
+        ("quote_asset_volume".to_string(), "DOUBLE"),
+        ("number_of_trades".to_string(), "BIGINT"),
+        ("taker_buy_base_asset_volume".to_string(), "DOUBLE"),
+        ("taker_buy_quote_asset_volume".to_string(), "DOUBLE"),
+        ("ignore_col".to_string(), "VARCHAR"),
+    ];
+
+    for i in 1..=rsi_count {
+        cols.push((format!("rsi_{}", i), "DOUBLE"));
+    }
+
+    cols
+}
+
+fn symbol_data_column_names(symbol: &str, rsi_count: usize) -> Result<Vec<String>> {
+    validate_ident(symbol)?;
+    Ok(data_column_specs(rsi_count)
+        .into_iter()
+        .map(|(name, _)| format!("{}_{}", symbol, name))
+        .collect())
+}
+
+fn quote_ident(ident: &str) -> String {
+    format!("\"{}\"", ident.replace('"', "\"\""))
+}
+
+fn escape_sql_string(value: &str) -> String {
+    value.replace('\'', "''")
 }
 
 fn build_insert_sql(table: &str, rsi_count: usize, replace_existing: bool) -> String {
