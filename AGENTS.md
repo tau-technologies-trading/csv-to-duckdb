@@ -2,11 +2,8 @@
 
 ## Project Overview
 
-- **Name**: csv-to-turso
-- **Version**: 1.1.0
 - **Language**: Rust (edition 2024)
 - **Purpose**: Import Binance Vision CSV files into a local Turso (libSQL) database
-- **Repository**: `/home/nikolai/Coding/Quant/csv-to-turso`
 
 ## Dependencies
 
@@ -24,9 +21,6 @@ turso = "0.5.3"              # Local Turso/SQLite database
 ### Basic Commands
 
 ```bash
-# Import with all defaults (BTCUSDT, 1s, klines, ../db/BTCUSDT/BTCUSDT.db)
-cargo run --release --
-
 # Specify output database
 cargo run --release -- --db ../db/BTCUSDT/BTCUSDT.db
 
