@@ -8,6 +8,7 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  BINARY_NAME: csv-to-duckdb
 
 jobs:
   build:
@@ -35,14 +36,16 @@ jobs:
             binary: csv-to-duckdb
 
           - target: x86_64-pc-windows-msvc
-            runner: blacksmith-4vcpu-ubuntu-2404
+            runner: windows-latest
             binary: csv-to-duckdb.exe
-            xwin: true
+            windows: true
+            duckdb_download_lib: true
 
           - target: aarch64-pc-windows-msvc
-            runner: blacksmith-4vcpu-ubuntu-2404
+            runner: windows-latest
             binary: csv-to-duckdb.exe
-            xwin: true
+            windows: true
+            duckdb_download_lib: true
 
     steps:
       - name: Checkout
@@ -53,73 +56,33 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
-      - name: Install Windows cross-build dependencies
-        if: matrix.xwin == true
-        run: |
-          set -e
-          sudo apt-get update
-          sudo apt-get install -y gnupg software-properties-common ca-certificates wget lsb-release
-
-          # Add LLVM apt repo and install Clang 19 + lld/llvm
-          wget -qO - https://apt.llvm.org/llvm-snapshot.gpg.key | sudo apt-key add -
-          sudo add-apt-repository "deb http://apt.llvm.org/$(lsb_release -cs)/ llvm-toolchain-$(lsb_release -cs)-19 main"
-          sudo apt-get update
-          sudo apt-get install -y clang-19 lld-19 llvm-19
-
-          # Prefer clang-19/clang++-19
-          sudo update-alternatives --install /usr/bin/clang clang /usr/bin/clang-19 100
-          sudo update-alternatives --install /usr/bin/clang++ clang++ /usr/bin/clang++-19 100
-
-          # Provide a clang-cl wrapper that forwards to clang-19 in cl compatibility mode
-          sudo tee /usr/local/bin/clang-cl > /dev/null <<'EOF'
-          #!/bin/sh
-          exec clang-19 --driver-mode=cl "$@"
-          EOF
-          sudo chmod +x /usr/local/bin/clang-cl
-          sudo ln -sf /usr/local/bin/clang-cl /usr/bin/clang-cl || true
-
-          # Install cargo-xwin
-          cargo install --locked cargo-xwin
-
-      - name: Patch DuckDB for Windows cross-compilation
-        if: matrix.xwin == true
-        run: |
-          # Create a temporary patch file
-          mkdir -p /tmp/patches
-          cat > /tmp/patches/variant_stats.patch <<'PATCH'
-          --- a/src/include/duckdb/storage/statistics/variant_stats.hpp
-          +++ b/src/include/duckdb/storage/statistics/variant_stats.hpp
-          @@ -56,10 +56,10 @@ public:
-               static optional_ptr<const BaseStatistics> GetUntypedStats(const BaseStatistics &stats);
-          
-               // Deleted rvalue reference overloads
-          -    DUCKDB_API static const BaseStatistics &GetTypedStats(const BaseStatistics &&stats) = delete;
-          +    static const BaseStatistics &GetTypedStats(const BaseStatistics &&stats) = delete;
-          
-          -    DUCKDB_API static optional_ptr<const BaseStatistics> GetUntypedStats(const BaseStatistics &&stats) = delete;
-          +    static optional_ptr<const BaseStatistics> GetUntypedStats(const BaseStatistics &&stats) = delete;
-             };
-          PATCH
-          
-          # Find the DuckDB source directory in the build cache and apply the patch
-          find ~/.cargo -name "variant_stats.hpp" -type f 2>/dev/null | while read file; do
-            echo "Patching: $file"
-            patch "$file" /tmp/patches/variant_stats.patch || true
-          done
-
-      - name: Build Windows release binary
-        if: matrix.xwin == true
-        run: cargo xwin build --release --target ${{ matrix.target }}
-
       - name: Build release binary
-        if: matrix.xwin != true
+        env:
+          DUCKDB_DOWNLOAD_LIB: ${{ matrix.duckdb_download_lib }}
         run: cargo build --release --target ${{ matrix.target }}
 
+      - name: Copy Windows runtime library
+        if: matrix.windows == true
+        shell: pwsh
+        run: |
+          Copy-Item "target/${{ matrix.target }}/release/deps/duckdb.dll" "target/${{ matrix.target }}/release/duckdb.dll"
+
       - name: Upload binary
+        if: matrix.windows != true
         uses: actions/upload-artifact@v7.0.1
         with:
-          name: csv-to-duckdb-${{ matrix.target }}
+          name: ${{ env.BINARY_NAME }}-${{ matrix.target }}
           path: target/${{ matrix.target }}/release/${{ matrix.binary }}
+          if-no-files-found: error
+
+      - name: Upload Windows binary
+        if: matrix.windows == true
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: ${{ env.BINARY_NAME }}-${{ matrix.target }}
+          path: |
+            target/${{ matrix.target }}/release/${{ matrix.binary }}
+            target/${{ matrix.target }}/release/duckdb.dll
           if-no-files-found: error
 
   release:
@@ -156,6 +119,7 @@ jobs:
       - name: Package release assets
         env:
           RELEASE_TAG: ${{ steps.version.outputs.tag }}
+          BINARY_NAME: ${{ env.BINARY_NAME }}
         run: |
           python3 - <<'PY'
           import os
@@ -164,6 +128,7 @@ jobs:
           from pathlib import Path
 
           tag = os.environ["RELEASE_TAG"]
+          binary_name = os.environ["BINARY_NAME"]
           dist = Path("dist")
           dist.mkdir(exist_ok=True)
 
@@ -180,28 +145,32 @@ jobs:
           ]
 
           for target in unix_targets:
-              source = Path("artifacts") / f"csv-to-duckdb-{target}" / "csv-to-duckdb"
-              archive = dist / f"csv-to-duckdb-{tag}-{target}.tar.gz"
+              source = Path("artifacts") / f"{binary_name}-{target}" / binary_name
+              archive = dist / f"{binary_name}-{tag}-{target}.tar.gz"
 
               if not source.exists():
                   raise FileNotFoundError(source)
 
               with tarfile.open(archive, "w:gz") as tar:
-                  info = tar.gettarinfo(source, arcname="csv-to-duckdb")
+                  info = tar.gettarinfo(source, arcname=binary_name)
                   info.mode = 0o755
 
                   with source.open("rb") as binary:
                       tar.addfile(info, binary)
 
           for target in windows_targets:
-              source = Path("artifacts") / f"csv-to-duckdb-{target}" / "csv-to-duckdb.exe"
-              archive = dist / f"csv-to-duckdb-{tag}-{target}.zip"
+              source = Path("artifacts") / f"{binary_name}-{target}" / f"{binary_name}.exe"
+              duckdb_dll = Path("artifacts") / f"{binary_name}-{target}" / "duckdb.dll"
+              archive = dist / f"{binary_name}-{tag}-{target}.zip"
 
               if not source.exists():
                   raise FileNotFoundError(source)
+              if not duckdb_dll.exists():
+                  raise FileNotFoundError(duckdb_dll)
 
               with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as zip_file:
-                  zip_file.write(source, arcname="csv-to-duckdb.exe")
+                  zip_file.write(source, arcname=f"{binary_name}.exe")
+                  zip_file.write(duckdb_dll, arcname="duckdb.dll")
           PY
 
       - name: Generate release notes
