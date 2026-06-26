@@ -81,6 +81,32 @@ jobs:
           # Install cargo-xwin
           cargo install --locked cargo-xwin
 
+      - name: Patch DuckDB for Windows cross-compilation
+        if: matrix.xwin == true
+        run: |
+          # Create a temporary patch file
+          mkdir -p /tmp/patches
+          cat > /tmp/patches/variant_stats.patch <<'PATCH'
+          --- a/src/include/duckdb/storage/statistics/variant_stats.hpp
+          +++ b/src/include/duckdb/storage/statistics/variant_stats.hpp
+          @@ -56,10 +56,10 @@ public:
+               static optional_ptr<const BaseStatistics> GetUntypedStats(const BaseStatistics &stats);
+          
+               // Deleted rvalue reference overloads
+          -    DUCKDB_API static const BaseStatistics &GetTypedStats(const BaseStatistics &&stats) = delete;
+          +    static const BaseStatistics &GetTypedStats(const BaseStatistics &&stats) = delete;
+          
+          -    DUCKDB_API static optional_ptr<const BaseStatistics> GetUntypedStats(const BaseStatistics &&stats) = delete;
+          +    static optional_ptr<const BaseStatistics> GetUntypedStats(const BaseStatistics &&stats) = delete;
+             };
+          PATCH
+          
+          # Find the DuckDB source directory in the build cache and apply the patch
+          find ~/.cargo -name "variant_stats.hpp" -type f 2>/dev/null | while read file; do
+            echo "Patching: $file"
+            patch "$file" /tmp/patches/variant_stats.patch || true
+          done
+
       - name: Build Windows release binary
         if: matrix.xwin == true
         run: cargo xwin build --release --target ${{ matrix.target }}
