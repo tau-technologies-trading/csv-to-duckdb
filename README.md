@@ -16,6 +16,10 @@ Use `--ignore-extra-columns` to ignore CSV fields beyond the 12 Binance columns,
 
 `--report-file-progress` prints `@@CSV_FILE_IMPORTED@@` after each file is imported or skipped. `--import-mode safe`, `balanced`, and `unsafe` choose the write strategy; `balanced` is the default. Run `--help` for the remaining options. The old multi-folder and wide-database modes have been removed.
 
+## Rust library
+
+The crate exposes `import_folder` for applications that want to import one directory directly. It accepts an `ImportOptions` value and calls the supplied callback once for each CSV imported or skipped.
+
 ## Checks
 
 ```sh
