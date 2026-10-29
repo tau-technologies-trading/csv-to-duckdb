@@ -2,7 +2,7 @@
 name = "csv-to-duckdb"
 version = "1.0.0"
 edition = "2024"
-rust-version = "1.87"
+rust-version = "1.90"
 authors = ["Tau Technologies"]
 description = "CLI converting Binance Vision CSVs to a DuckDB .duckdb file"
 readme = "README.md"

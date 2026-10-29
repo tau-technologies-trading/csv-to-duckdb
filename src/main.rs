@@ -1,10 +1,10 @@
 use anyhow::{Context, Result, bail};
 use clap::{Parser, ValueEnum};
 use csv::{ReaderBuilder, StringRecord};
-use duckdb::{Appender, Connection, appender_params_from_iter, params, types::ToSql};
+use duckdb::{Appender, Connection, appender_params_from_iter, types::ToSql};
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use std::fs::{self, File};
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::thread;
@@ -14,11 +14,6 @@ const BINANCE_COLS: usize = 12;
 const PROGRESS_FLUSH_ROWS: u64 = 8192;
 const DEFAULT_SINGLE_DIR: &str = "../data/BTCUSDT/";
 const DEFAULT_SINGLE_DB: &str = "../db/BTCUSDT/BTCUSDT.duckdb";
-const DEFAULT_ALL_DIR: &str = "../data/";
-const DEFAULT_ALL_DB_DIR: &str = "../db/";
-const DEFAULT_ONE_FILE_DB: &str = "../db/klines.duckdb";
-const METADATA_TABLE: &str = "symbol_columns";
-const STAGING_TABLE: &str = "__csv_to_duckdb_staging";
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum ImportMode {
@@ -42,10 +37,10 @@ enum RecreateAction {
 #[derive(Parser, Debug)]
 #[command(
     about = "Import Binance Vision CSV files into a local DuckDB database",
-    long_about = "Import Binance Vision CSV files into local DuckDB databases.\n\nProvide at least one option. The default single-symbol import reads matching files like BTCUSDT-1s-2026-04.csv from ../data/BTCUSDT/, creates ../db/BTCUSDT/BTCUSDT.duckdb, and imports rows into klines. With --multiple-files, it scans ../data/ recursively and mirrors every CSV directory under ../db/, creating one {symbol}.duckdb database for each CSV file group. With --one-file, it scans ../data/ recursively and creates one wide time-aligned DuckDB table plus a metadata DuckDB file mapping each currency to its actual table column range. Existing rows are skipped by default in row-oriented imports so interrupted imports can resume safely. Use --auto N for the newest N files, --recreate to rebuild from scratch, --recreate-pragmatic to rebuild only this table when other user tables exist, and --replace-existing to overwrite duplicate primary keys. Import mode controls the row-oriented insert path: safe uses row-by-row prepared statements, balanced uses DuckDB's Appender with periodic flushes, and unsafe uses the Appender with minimal flushing.",
+    long_about = "Import one folder of Binance Vision CSVs into a DuckDB database. Files are processed chronologically; --jobs controls parallel file inspection. Files ending at or before the database maximum are skipped; the first extending file replaces overlaps.",
     version,
     disable_version_flag = true,
-    after_help = "Examples:\n  csv-to-duckdb --auto 3\n  csv-to-duckdb -o ../db/BTCUSDT/BTCUSDT.duckdb --recreate\n  csv-to-duckdb --one-file\n  csv-to-duckdb --one-file -d ../data/ -o ../db/klines.duckdb --recreate\n  csv-to-duckdb --multiple-files\n  csv-to-duckdb --multiple-files --jobs 4\n  csv-to-duckdb --multiple-files -d ../data/ -o ../db/ --recreate-pragmatic\n  csv-to-duckdb --import-mode unsafe --batch-size 500000\n  csv-to-duckdb --has-header --replace-existing\n  csv-to-duckdb -d ../data/ETHUSDT --db ../db/ETHUSDT/ETHUSDT.duckdb --interval 1m --table eth_klines\n\nVerification:\n  duckdb ../db/BTCUSDT/BTCUSDT.duckdb 'SELECT COUNT(*) FROM klines;'\n  duckdb ../db/klines_metadata.duckdb 'SELECT * FROM symbol_columns;'\n\nNotes:\n  At least one option is required; run --auto, --one-file, --multiple-files, --recreate, or an explicit path option to import.\n  Defaults: --dir ../data/BTCUSDT/, --db ../db/BTCUSDT/BTCUSDT.duckdb, --interval 1s, --table klines.\n  With --one-file and unchanged defaults: --dir ../data/, --db ../db/klines.duckdb.\n  With --multiple-files and unchanged defaults: --dir ../data/, --db ../db/.\n  --one-file creates a wide table aligned by open_time and a metadata DB named like *_metadata.duckdb.\n  --multiple-files imports each CSV directory/file group into its own {symbol}.duckdb database.\n  Files must follow SYMBOL-INTERVAL-YYYY-MM.csv; symbols are inferred from filenames.\n  Imports the 12 Binance Vision kline columns plus any extra RSI columns.\n  Import modes: safe (prepared statements), balanced (Appender + periodic flushes), unsafe (Appender + minimal flushing).\n  --replace-existing forces prepared-statement inserts because DuckDB Appender does not support conflict handling."
+    after_help = "Examples:\n  csv-to-duckdb --dir ../data/BTCUSDT --db ../db/BTCUSDT/BTCUSDT.duckdb --jobs 4\n  csv-to-duckdb --auto 3\n  csv-to-duckdb --ignore-extra-columns\n  csv-to-duckdb --replace-existing"
 )]
 #[derive(Clone)]
 struct Args {
@@ -53,7 +48,7 @@ struct Args {
     #[arg(short, long, default_value = DEFAULT_SINGLE_DIR)]
     dir: PathBuf,
 
-    /// Output DuckDB database path, or output root directory with --multiple-files
+    /// Output DuckDB database path
     #[arg(short = 'o', long, default_value = DEFAULT_SINGLE_DB)]
     db: String,
 
@@ -76,6 +71,14 @@ struct Args {
     /// CSV has a header row
     #[arg(long, default_value_t = false)]
     has_header: bool,
+
+    /// Ignore all CSV columns after the 12 standard Binance kline columns.
+    #[arg(long, default_value_t = false)]
+    ignore_extra_columns: bool,
+
+    /// Comma-separated Binance columns to omit (use an empty value to keep all).
+    #[arg(long, default_value = "ignore")]
+    drop_columns: String,
 
     /// Delete DB file and recreate from scratch before importing
     #[arg(long, default_value_t = false)]
@@ -101,21 +104,13 @@ struct Args {
     #[arg(long)]
     auto: Option<usize>,
 
-    /// Hidden compatibility alias for --one-file
-    #[arg(long, default_value_t = false, hide = true)]
-    all: bool,
-
-    /// Recursively import every CSV directory into one wide time-aligned database
-    #[arg(long, default_value_t = false)]
-    one_file: bool,
-
-    /// Recursively import every CSV directory into mirrored per-symbol databases
-    #[arg(long, default_value_t = false)]
-    multiple_files: bool,
-
-    /// Number of CSV directories to process in parallel with --multiple-files
-    #[arg(long, default_value_t = 1)]
+    /// Maximum number of CSV files to inspect concurrently.
+    #[arg(long, default_value_t = 4)]
     jobs: usize,
+
+    /// Emit a machine-readable marker after each file is imported or skipped.
+    #[arg(long, default_value_t = false)]
+    report_file_progress: bool,
 
     /// Print version information and exit.
     #[arg(short = 'v', long = "version", action = clap::ArgAction::SetTrue, required = false)]
@@ -129,7 +124,45 @@ struct CsvFile {
     month: u32,
 }
 
-struct ParsedRow {
+const COLUMN_NAMES: [&str; 12] = [
+    "open_time",
+    "open",
+    "high",
+    "low",
+    "close",
+    "volume",
+    "close_time",
+    "quote_asset_volume",
+    "number_of_trades",
+    "taker_buy_base_asset_volume",
+    "taker_buy_quote_asset_volume",
+    "ignore_col",
+];
+
+fn dropped_columns(args: &Args) -> Result<Vec<usize>> {
+    let mut result = Vec::new();
+    for name in args
+        .drop_columns
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        let name = if name == "ignore" { "ignore_col" } else { name };
+        let index = COLUMN_NAMES
+            .iter()
+            .position(|col| *col == name)
+            .with_context(|| format!("unknown column: {name}"))?;
+        if index == 0 || index == 4 {
+            bail!("{name} is required for importing and RSI");
+        }
+        if !result.contains(&index) {
+            result.push(index);
+        }
+    }
+    Ok(result)
+}
+
+struct ParsedRow<'a> {
     open_time: i64,
     open: f64,
     high: f64,
@@ -141,13 +174,12 @@ struct ParsedRow {
     number_of_trades: i64,
     taker_buy_base_asset_volume: f64,
     taker_buy_quote_asset_volume: f64,
-    ignore_col: String,
+    ignore_col: &'a str,
     rsi_values: Vec<Option<f64>>,
 }
 
 struct FileStats {
     row_count: usize,
-    last_open_time: Option<i64>,
 }
 
 struct ImportJob {
@@ -156,13 +188,6 @@ struct ImportJob {
     symbol: String,
     interval: String,
     files: Vec<CsvFile>,
-}
-
-struct SymbolMetadata {
-    symbol: String,
-    start_column: usize,
-    end_column: usize,
-    first_open_time: i64,
 }
 
 struct ProgressUi {
@@ -336,294 +361,11 @@ fn main() -> Result<()> {
         bail!("no arguments provided; use --help for usage");
     }
 
-    let dir_arg_provided = arg_was_provided("-d", "--dir");
-    let db_arg_provided = arg_was_provided("-o", "--db");
     let args = Args::parse();
-    let _ = args.version_flag;
-
     validate_args(&args)?;
     validate_ident(&args.table)?;
-
-    let mut args = args;
-    if one_file_requested(&args) && args.jobs > 1 {
-        eprintln!(
-            "Warning: --one-file writes to a single DuckDB file; --jobs {} capped to 1",
-            args.jobs
-        );
-        args.jobs = 1;
-    }
-
-    if args.multiple_files {
-        let cpus = thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(1);
-        if args.jobs > cpus {
-            let old = args.jobs;
-            args.jobs = cpus;
-            eprintln!(
-                "Warning: --jobs {} exceeds available system threads ({}); capped to {}",
-                old, cpus, args.jobs
-            );
-        }
-    }
-
-    if one_file_requested(&args) {
-        run_one_file_import(&args, dir_arg_provided, db_arg_provided)?;
-    } else if args.multiple_files {
-        let jobs = build_import_jobs(&args, dir_arg_provided, db_arg_provided)?;
-        let max_parallel = args.jobs.min(jobs.len());
-        println!(
-            "Found {} import job(s). Processing up to {} folder(s) in parallel.",
-            jobs.len(),
-            max_parallel
-        );
-        run_all_import_jobs(args, jobs)?;
-    } else {
-        let jobs = build_import_jobs(&args, dir_arg_provided, db_arg_provided)?;
-        let progress_ui = ProgressUi::new();
-        for job in jobs {
-            run_import_job(&args, job, Arc::clone(&progress_ui))?;
-        }
-    }
-
-    Ok(())
-}
-
-fn one_file_requested(args: &Args) -> bool {
-    args.one_file || args.all
-}
-
-fn run_all_import_jobs(args: Args, jobs: Vec<ImportJob>) -> Result<()> {
-    let max_parallel = args.jobs.min(jobs.len());
-    let args = Arc::new(args);
-    let progress_ui = ProgressUi::new();
-    let mut handles = Vec::new();
-    let mut job_iter = jobs.into_iter();
-
-    for _ in 0..max_parallel {
-        let Some(job) = job_iter.next() else {
-            break;
-        };
-        let args = Arc::clone(&args);
-        let ui = Arc::clone(&progress_ui);
-        handles.push(thread::spawn(move || run_import_job(&args, job, ui)));
-    }
-
-    while let Some(handle) = handles.pop() {
-        handle
-            .join()
-            .map_err(|e| anyhow::anyhow!("import thread panicked: {:?}", e))??;
-
-        if let Some(job) = job_iter.next() {
-            let args = Arc::clone(&args);
-            let ui = Arc::clone(&progress_ui);
-            handles.push(thread::spawn(move || run_import_job(&args, job, ui)));
-        }
-    }
-
-    Ok(())
-}
-
-fn run_one_file_import(args: &Args, dir_arg_provided: bool, db_arg_provided: bool) -> Result<()> {
-    let dir = if dir_arg_provided {
-        args.dir.clone()
-    } else {
-        PathBuf::from(DEFAULT_ALL_DIR)
-    };
-    let db_path = if db_arg_provided {
-        PathBuf::from(&args.db)
-    } else {
-        PathBuf::from(DEFAULT_ONE_FILE_DB)
-    };
-    let metadata_path = metadata_db_path(&db_path);
-
-    let mut jobs = discover_one_file_import_jobs(&dir)?;
-    jobs.sort_by(|a, b| a.symbol.cmp(&b.symbol).then_with(|| a.dir.cmp(&b.dir)));
-    ensure_unique_symbols(&jobs)?;
-    ensure_single_interval(&jobs)?;
-
-    if let Some(parent) = db_path.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("Cannot create {}", parent.display()))?;
-    }
-    if let Some(parent) = metadata_path.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("Cannot create {}", parent.display()))?;
-    }
-
-    let db_path_str = db_path.to_string_lossy().to_string();
-    let metadata_path_str = metadata_path.to_string_lossy().to_string();
-    let recreate_action = determine_recreate_action(args, &db_path_str)?;
-    if recreate_action == RecreateAction::DeleteDatabaseFiles {
-        remove_database_files(&db_path_str)?;
-        remove_database_files(&metadata_path_str)?;
-    }
-
-    let conn = Connection::open(&db_path)
-        .with_context(|| format!("Cannot open DuckDB database at {}", db_path.display()))?;
-    let metadata_conn = Connection::open(&metadata_path).with_context(|| {
-        format!(
-            "Cannot open DuckDB metadata database at {}",
-            metadata_path.display()
-        )
-    })?;
-
-    if recreate_action == RecreateAction::DropTableOnly {
-        conn.execute_batch(&format!(
-            "DROP TABLE IF EXISTS {}",
-            quote_ident(&args.table)
-        ))?;
-        conn.execute_batch("CHECKPOINT")?;
-        conn.execute_batch("VACUUM")?;
-        conn.execute_batch("CHECKPOINT")?;
-        metadata_conn.execute_batch(&format!(
-            "DROP TABLE IF EXISTS {}",
-            quote_ident(METADATA_TABLE)
-        ))?;
-        metadata_conn.execute_batch("CHECKPOINT")?;
-    }
-
-    create_wide_table(&conn, &args.table)?;
-    create_metadata_table(&metadata_conn)?;
-
-    let progress_ui = ProgressUi::new();
-    progress_ui.println(format!(
-        "Importing {} symbol(s) from {} into one wide DB {}",
-        jobs.len(),
-        dir.display(),
-        db_path.display()
-    ));
-    progress_ui.println(format!(
-        "Writing metadata into {} table {}",
-        metadata_path.display(),
-        METADATA_TABLE
-    ));
-
-    for mut job in jobs {
-        job.files.sort_by_key(|f| (f.year, f.month, f.path.clone()));
-        apply_auto_file_limit(&mut job.files, args.auto);
-
-        if job.files.is_empty() {
-            continue;
-        }
-
-        if metadata_has_symbol(&metadata_conn, &job.symbol)? {
-            progress_ui.println(format!(
-                "Skipping {} because it already exists in metadata; use --recreate to rebuild",
-                job.symbol
-            ));
-            continue;
-        }
-
-        warn_missing_months(&job.files, &progress_ui);
-        let rsi_count = infer_max_rsi_columns(&job.files, args.has_header)?;
-        let file_stats = collect_file_stats(&job.files, args.has_header)?;
-        let expected_rows = file_stats
-            .iter()
-            .map(|stats| stats.row_count)
-            .sum::<usize>();
-
-        progress_ui.println(format!(
-            "Staging {} {} from {} ({} file(s), {} expected row(s), {} RSI column(s))",
-            job.symbol,
-            job.interval,
-            job.dir.display(),
-            job.files.len(),
-            expected_rows,
-            rsi_count
-        ));
-
-        create_staging_table(&conn, rsi_count)?;
-        let staged_rows = import_symbol_to_staging(
-            &conn,
-            args,
-            &job,
-            rsi_count,
-            &file_stats,
-            Arc::clone(&progress_ui),
-        )?;
-
-        if staged_rows == 0 {
-            drop_staging_table(&conn)?;
-            progress_ui.println(format!(
-                "Skipping {} because no rows were staged",
-                job.symbol
-            ));
-            continue;
-        }
-
-        let metadata = merge_staging_into_wide_table(&conn, &args.table, &job.symbol, rsi_count)?;
-        insert_symbol_metadata(&metadata_conn, &metadata)?;
-        drop_staging_table(&conn)?;
-
-        progress_ui.println(format!(
-            "Mapped {} to columns {}-{} (first_open_time={})",
-            metadata.symbol, metadata.start_column, metadata.end_column, metadata.first_open_time
-        ));
-    }
-
-    conn.execute_batch("CHECKPOINT")?;
-    metadata_conn.execute_batch("CHECKPOINT")?;
-    progress_ui.println("Done. One-file import complete.");
-
-    Ok(())
-}
-
-fn discover_one_file_import_jobs(dir: &Path) -> Result<Vec<ImportJob>> {
-    let mut jobs = Vec::new();
-    collect_all_import_jobs(dir, dir, Path::new("."), &mut jobs)?;
-    if jobs.is_empty() {
-        bail!("No CSV directories found in {}", dir.display());
-    }
-    Ok(jobs)
-}
-
-fn ensure_unique_symbols(jobs: &[ImportJob]) -> Result<()> {
-    for pair in jobs.windows(2) {
-        if pair[0].symbol == pair[1].symbol {
-            bail!(
-                "Duplicate symbol {} found in both {} and {}; --one-file requires one CSV directory per symbol",
-                pair[0].symbol,
-                pair[0].dir.display(),
-                pair[1].dir.display()
-            );
-        }
-    }
-    Ok(())
-}
-
-fn ensure_single_interval(jobs: &[ImportJob]) -> Result<()> {
-    let Some(first) = jobs.first() else {
-        return Ok(());
-    };
-
-    for job in &jobs[1..] {
-        if job.interval != first.interval {
-            bail!(
-                "Mixed intervals are not supported with --one-file: found both {} in {} and {} in {}",
-                first.interval,
-                first.dir.display(),
-                job.interval,
-                job.dir.display()
-            );
-        }
-    }
-
-    Ok(())
-}
-
-fn metadata_db_path(db_path: &Path) -> PathBuf {
-    let parent = db_path.parent().unwrap_or_else(|| Path::new(""));
-    let stem = db_path
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("metadata");
-    let extension = db_path
-        .extension()
-        .and_then(|s| s.to_str())
-        .unwrap_or("duckdb");
-
-    parent.join(format!("{}_metadata.{}", stem, extension))
+    let job = import_job_for_single_directory(&args.dir, PathBuf::from(&args.db), &args.interval)?;
+    run_import_job(&args, job, ProgressUi::new())
 }
 
 fn run_import_job(args: &Args, mut job: ImportJob, progress_ui: Arc<ProgressUi>) -> Result<()> {
@@ -641,37 +383,12 @@ fn run_import_job(args: &Args, mut job: ImportJob, progress_ui: Arc<ProgressUi>)
 
     warn_missing_months(&job.files, &progress_ui);
 
-    let rsi_count = infer_max_rsi_columns(&job.files, args.has_header)?;
-    let file_stats = collect_file_stats(&job.files, args.has_header)?;
-    let expected_rows = file_stats
-        .iter()
-        .map(|stats| stats.row_count)
-        .sum::<usize>();
-
-    progress_ui.println(format!(
-        "Importing {} {} from {} into {}",
-        job.symbol,
-        job.interval,
-        job.dir.display(),
-        job.db_path.display()
-    ));
-    progress_ui.println(format!(
-        "Found {} file(s). Max RSI columns: {}. Expected rows: {}",
-        job.files.len(),
-        rsi_count,
-        expected_rows
-    ));
-    progress_ui.println(format!(
-        "Import mode: {:?}. Batch size: {}. Conflict mode: {}.",
-        args.import_mode,
-        args.batch_size,
-        if args.replace_existing {
-            "REPLACE"
-        } else {
-            "IGNORE"
-        }
-    ));
-
+    let dropped = dropped_columns(args)?;
+    let mut rsi_count = if args.ignore_extra_columns {
+        0
+    } else {
+        infer_max_rsi_columns(&job.files, args.has_header)?
+    };
     if let Some(parent) = job.db_path.parent() {
         fs::create_dir_all(parent)
             .with_context(|| format!("Cannot create {}", parent.display()))?;
@@ -693,20 +410,65 @@ fn run_import_job(args: &Args, mut job: ImportJob, progress_ui: Arc<ProgressUi>)
         conn.execute_batch("CHECKPOINT")?;
     }
 
-    create_table(&conn, &args.table, rsi_count)?;
-    let resume_open_time = if args.replace_existing {
-        None
+    create_table(&conn, &args.table, rsi_count, &dropped)?;
+    let db_max: Option<i64> = conn.query_row(
+        &format!("SELECT MAX(open_time) FROM {}", args.table),
+        [],
+        |row| row.get(0),
+    )?;
+    if args.skip_order_check && db_max.is_some() && !args.replace_existing {
+        bail!(
+            "--skip-order-check cannot be used for incremental updates; use --replace-existing to reimport selected files"
+        );
+    }
+    let mut selected = Vec::new();
+    for file in &job.files {
+        let last = last_file_open_time(file, args.has_header)?;
+        if !args.replace_existing
+            && db_max.is_some()
+            && last.is_none_or(|last| last <= db_max.unwrap())
+        {
+            progress_ui.println(format!(
+                "Skipped {} (already covered by database)",
+                file.path.display()
+            ));
+            if args.report_file_progress {
+                println!("@@CSV_FILE_IMPORTED@@");
+            }
+        } else {
+            selected.push(file.clone());
+        }
+    }
+    job.files = selected;
+    let first_overlap = if let (Some(max), Some(first)) = (db_max, job.files.first()) {
+        let mut reader = ReaderBuilder::new()
+            .has_headers(args.has_header)
+            .flexible(true)
+            .from_path(&first.path)?;
+        let mut record = StringRecord::new();
+        reader.read_record(&mut record)? && parse_i64(&record, 0, "open_time")? <= max
     } else {
-        max_open_time(&conn, &args.table)?
+        false
     };
+    let file_stats = collect_file_stats(&job.files, args.has_header, args.jobs)?;
+    rsi_count = validate_and_extend_row_schema(&conn, &args.table, rsi_count, &dropped)?;
+    let expected_rows = file_stats
+        .iter()
+        .map(|stats| stats.row_count)
+        .sum::<usize>();
+    progress_ui.println(format!(
+        "Importing {} files ({} rows) into {}",
+        job.files.len(),
+        expected_rows,
+        db_path
+    ));
 
     let start = Instant::now();
     let mut total_rows = 0usize;
     let mut last_open_time: Option<i64> = None;
     let mut progress = progress_ui.start_job(&job.symbol, Some(expected_rows as u64));
 
-    let use_appender = matches!(args.import_mode, ImportMode::Balanced | ImportMode::Unsafe)
-        && !args.replace_existing;
+    let use_appender = matches!(args.import_mode, ImportMode::Balanced | ImportMode::Unsafe);
 
     if use_appender {
         import_all_files_with_appender(
@@ -715,11 +477,12 @@ fn run_import_job(args: &Args, mut job: ImportJob, progress_ui: Arc<ProgressUi>)
             args,
             rsi_count,
             &conn,
+            &dropped,
+            first_overlap,
             &mut total_rows,
             &mut last_open_time,
             start,
             &mut progress,
-            resume_open_time,
         )?;
     } else {
         import_all_files_with_prepared_stmts(
@@ -728,11 +491,12 @@ fn run_import_job(args: &Args, mut job: ImportJob, progress_ui: Arc<ProgressUi>)
             args,
             rsi_count,
             &conn,
+            &dropped,
+            first_overlap,
             &mut total_rows,
             &mut last_open_time,
             start,
             &mut progress,
-            resume_open_time,
         )?;
     }
 
@@ -741,7 +505,7 @@ fn run_import_job(args: &Args, mut job: ImportJob, progress_ui: Arc<ProgressUi>)
     let elapsed = start.elapsed().as_secs_f64();
     let average_rows_per_second = total_rows as f64 / elapsed.max(0.001);
     progress_ui.println(format!(
-        "Done. Imported {} rows into {} in {:.1}s (average speed {:.0} rows/second)",
+        "Done. Processed {} input rows for {} in {:.1}s (average speed {:.0} rows/second)",
         total_rows, db_path, elapsed, average_rows_per_second
     ));
 
@@ -754,50 +518,57 @@ fn import_all_files_with_appender(
     args: &Args,
     rsi_count: usize,
     conn: &Connection,
+    dropped: &[usize],
+    first_overlap: bool,
     total_rows: &mut usize,
     last_open_time: &mut Option<i64>,
     start: Instant,
     progress: &mut JobProgress,
-    resume_open_time: Option<i64>,
 ) -> Result<()> {
-    let mut appender = conn
-        .appender(&args.table)
-        .with_context(|| format!("Cannot create Appender for table {}", args.table))?;
-
-    for (file, stats) in files.iter().zip(file_stats.iter()) {
+    conn.execute_batch(&format!(
+        "CREATE TEMP TABLE __csv_import_stage AS SELECT * FROM {} WHERE false",
+        args.table
+    ))?;
+    for (file_index, (file, stats)) in files.iter().zip(file_stats.iter()).enumerate() {
         let file_name = file.path.file_name().unwrap().to_string_lossy().to_string();
         let mut progress_slot = progress.acquire_slot(&file_name, Some(stats.row_count as u64));
 
-        if should_skip_file(stats, resume_open_time) {
-            progress_slot.inc(stats.row_count as u64);
-            progress_slot.finish();
-
-            if let Some(file_last_open_time) = stats.last_open_time {
-                *last_open_time = Some(file_last_open_time);
-            }
-
-            progress.println(format!("Imported {:>12} rows from {}", 0, file_name));
-            continue;
-        }
-
+        let mut appender = conn
+            .appender("__csv_import_stage")
+            .context("Cannot create staging Appender")?;
         let imported = import_file_with_appender(
             file,
             args,
             rsi_count,
             &mut appender,
+            dropped,
             conn,
             total_rows,
             last_open_time,
             start,
             &progress_slot,
-            resume_open_time,
         )?;
+        appender.flush()?;
+        drop(appender);
+        conn.execute_batch(&format!(
+            "INSERT OR {} INTO {} SELECT * FROM __csv_import_stage",
+            if args.replace_existing || (first_overlap && file_index == 0) {
+                "REPLACE"
+            } else {
+                "IGNORE"
+            },
+            args.table
+        ))?;
+        conn.execute_batch("DELETE FROM __csv_import_stage")?;
         progress_slot.finish();
 
         progress.println(format!("Imported {:>12} rows from {}", imported, file_name));
+        if args.report_file_progress {
+            println!("@@CSV_FILE_IMPORTED@@");
+        }
     }
 
-    appender.flush()?;
+    conn.execute_batch("DROP TABLE __csv_import_stage")?;
     Ok(())
 }
 
@@ -807,48 +578,46 @@ fn import_all_files_with_prepared_stmts(
     args: &Args,
     rsi_count: usize,
     conn: &Connection,
+    dropped: &[usize],
+    first_overlap: bool,
     total_rows: &mut usize,
     last_open_time: &mut Option<i64>,
     start: Instant,
     progress: &mut JobProgress,
-    resume_open_time: Option<i64>,
 ) -> Result<()> {
-    let insert_sql = build_insert_sql(&args.table, rsi_count, args.replace_existing);
-    let mut stmt = conn.prepare(&insert_sql)?;
-
     conn.execute_batch("BEGIN")?;
 
-    for (file, stats) in files.iter().zip(file_stats.iter()) {
+    for (file_index, (file, stats)) in files.iter().zip(file_stats.iter()).enumerate() {
         let file_name = file.path.file_name().unwrap().to_string_lossy().to_string();
         let mut progress_slot = progress.acquire_slot(&file_name, Some(stats.row_count as u64));
 
-        if should_skip_file(stats, resume_open_time) {
-            progress_slot.inc(stats.row_count as u64);
-            progress_slot.finish();
-
-            if let Some(file_last_open_time) = stats.last_open_time {
-                *last_open_time = Some(file_last_open_time);
-            }
-
-            progress.println(format!("Imported {:>12} rows from {}", 0, file_name));
-            continue;
-        }
-
+        let insert_sql = build_insert_sql(
+            &args.table,
+            rsi_count,
+            args.replace_existing || (first_overlap && file_index == 0),
+            dropped,
+        );
+        let mut stmt = conn.prepare(&insert_sql)?;
         let imported = import_file_with_prepared_stmt(
             file,
             args,
             rsi_count,
             &mut stmt,
+            dropped,
             conn,
             total_rows,
             last_open_time,
             start,
             &progress_slot,
-            resume_open_time,
         )?;
         progress_slot.finish();
 
         progress.println(format!("Imported {:>12} rows from {}", imported, file_name));
+        conn.execute_batch("COMMIT")?;
+        if args.report_file_progress {
+            println!("@@CSV_FILE_IMPORTED@@");
+        }
+        conn.execute_batch("BEGIN")?;
     }
 
     conn.execute_batch("COMMIT")?;
@@ -859,21 +628,8 @@ fn print_version() {
     println!("{} {}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
 }
 
-fn arg_was_provided(short: &str, long: &str) -> bool {
-    std::env::args_os().skip(1).any(|arg| {
-        arg == short || arg == long || arg.to_string_lossy().starts_with(&format!("{}=", long))
-    })
-}
-
 fn validate_args(args: &Args) -> Result<()> {
-    if one_file_requested(args) && args.multiple_files {
-        bail!("--one-file and --multiple-files cannot be used together");
-    }
-
-    if one_file_requested(args) && args.replace_existing {
-        bail!("--replace-existing is not supported with --one-file; use --recreate instead");
-    }
-
+    dropped_columns(args)?;
     if args.batch_size == 0 {
         bail!("--batch-size must be greater than 0");
     }
@@ -899,41 +655,6 @@ fn validate_args(args: &Args) -> Result<()> {
     }
 
     Ok(())
-}
-
-fn build_import_jobs(
-    args: &Args,
-    dir_arg_provided: bool,
-    db_arg_provided: bool,
-) -> Result<Vec<ImportJob>> {
-    if args.multiple_files {
-        let dir = if dir_arg_provided {
-            args.dir.clone()
-        } else {
-            PathBuf::from(DEFAULT_ALL_DIR)
-        };
-        let db_root = if db_arg_provided {
-            PathBuf::from(&args.db)
-        } else {
-            PathBuf::from(DEFAULT_ALL_DB_DIR)
-        };
-
-        let mut jobs = Vec::new();
-        collect_all_import_jobs(&dir, &dir, &db_root, &mut jobs)?;
-        jobs.sort_by(|a, b| a.dir.cmp(&b.dir));
-
-        if jobs.is_empty() {
-            bail!("No CSV directories found in {}", dir.display());
-        }
-
-        return Ok(jobs);
-    }
-
-    Ok(vec![import_job_for_single_directory(
-        &args.dir,
-        PathBuf::from(&args.db),
-        &args.interval,
-    )?])
 }
 
 fn import_job_for_single_directory(
@@ -1007,111 +728,6 @@ fn import_job_for_single_directory(
         interval: interval.to_string(),
         files,
     })
-}
-
-fn collect_all_import_jobs(
-    root: &Path,
-    dir: &Path,
-    db_root: &Path,
-    jobs: &mut Vec<ImportJob>,
-) -> Result<()> {
-    if let Some(job) = import_job_for_directory(root, dir, db_root)? {
-        jobs.push(job);
-    }
-
-    for entry in fs::read_dir(dir).with_context(|| format!("Cannot read {}", dir.display()))? {
-        let entry = entry?;
-        let path = entry.path();
-
-        if path.is_dir() {
-            collect_all_import_jobs(root, &path, db_root, jobs)?;
-        }
-    }
-
-    Ok(())
-}
-
-fn import_job_for_directory(root: &Path, dir: &Path, db_root: &Path) -> Result<Option<ImportJob>> {
-    let mut symbol: Option<String> = None;
-    let mut interval: Option<String> = None;
-    let mut files = Vec::new();
-
-    for entry in fs::read_dir(dir).with_context(|| format!("Cannot read {}", dir.display()))? {
-        let entry = entry?;
-        let path = entry.path();
-
-        if !path.is_file() {
-            continue;
-        }
-
-        let Some(file_name) = path.file_name().and_then(|s| s.to_str()) else {
-            continue;
-        };
-
-        if !file_name.ends_with(".csv") {
-            continue;
-        }
-
-        let Some(parsed) = parse_filename(file_name) else {
-            eprintln!(
-                "Warning: ignoring CSV with unexpected name in {}: {}",
-                dir.display(),
-                file_name
-            );
-            continue;
-        };
-
-        match &symbol {
-            Some(existing) if existing != &parsed.0 => bail!(
-                "Mixed symbols in {}: found both {} and {}",
-                dir.display(),
-                existing,
-                parsed.0
-            ),
-            None => symbol = Some(parsed.0.clone()),
-            _ => {}
-        }
-
-        match &interval {
-            Some(existing) if existing != &parsed.1 => bail!(
-                "Mixed intervals in {}: found both {} and {}",
-                dir.display(),
-                existing,
-                parsed.1
-            ),
-            None => interval = Some(parsed.1.clone()),
-            _ => {}
-        }
-
-        files.push(CsvFile {
-            path,
-            year: parsed.2,
-            month: parsed.3,
-        });
-    }
-
-    let Some(symbol) = symbol else {
-        return Ok(None);
-    };
-    let interval = interval.context("missing interval for discovered CSV directory")?;
-    let relative_dir = dir.strip_prefix(root).with_context(|| {
-        format!(
-            "Cannot map {} relative to input root {}",
-            dir.display(),
-            root.display()
-        )
-    })?;
-    let db_path = db_root
-        .join(relative_dir)
-        .join(format!("{}.duckdb", symbol));
-
-    Ok(Some(ImportJob {
-        dir: dir.to_path_buf(),
-        db_path,
-        symbol,
-        interval,
-        files,
-    }))
 }
 
 fn apply_auto_file_limit(files: &mut Vec<CsvFile>, auto: Option<usize>) {
@@ -1250,11 +866,23 @@ fn infer_max_rsi_columns(files: &[CsvFile], has_header: bool) -> Result<usize> {
     Ok(max_rsi)
 }
 
-fn collect_file_stats(files: &[CsvFile], has_header: bool) -> Result<Vec<FileStats>> {
-    files
-        .iter()
-        .map(|file| scan_file_stats(file, has_header))
-        .collect()
+fn collect_file_stats(files: &[CsvFile], has_header: bool, jobs: usize) -> Result<Vec<FileStats>> {
+    let workers = jobs.min(files.len()).max(1);
+    let results = std::sync::Mutex::new(Vec::with_capacity(files.len()));
+    thread::scope(|scope| {
+        for index in 0..workers {
+            let results = &results;
+            scope.spawn(move || {
+                for file_index in (index..files.len()).step_by(workers) {
+                    let result = scan_file_stats(&files[file_index], has_header);
+                    results.lock().unwrap().push((file_index, result));
+                }
+            });
+        }
+    });
+    let mut results = results.into_inner().unwrap();
+    results.sort_by_key(|(index, _)| *index);
+    results.into_iter().map(|(_, result)| result).collect()
 }
 
 fn scan_file_stats(file: &CsvFile, has_header: bool) -> Result<FileStats> {
@@ -1264,7 +892,6 @@ fn scan_file_stats(file: &CsvFile, has_header: bool) -> Result<FileStats> {
     let mut buffer = Vec::with_capacity(4096);
     let mut skipped_header = false;
     let mut row_count = 0usize;
-    let mut last_open_time = None;
 
     loop {
         buffer.clear();
@@ -1287,16 +914,49 @@ fn scan_file_stats(file: &CsvFile, has_header: bool) -> Result<FileStats> {
         }
 
         row_count += 1;
-        last_open_time =
-            Some(parse_open_time_bytes(line).with_context(|| {
-                format!("Bad open_time while scanning {}", file.path.display())
-            })?);
+        parse_open_time_bytes(line)
+            .with_context(|| format!("Bad open_time while scanning {}", file.path.display()))?;
     }
 
-    Ok(FileStats {
-        row_count,
-        last_open_time,
-    })
+    Ok(FileStats { row_count })
+}
+
+// Read backwards in blocks so already covered monthly files do not require a full scan.
+fn last_file_open_time(file: &CsvFile, has_header: bool) -> Result<Option<i64>> {
+    let mut input =
+        File::open(&file.path).with_context(|| format!("Cannot open {}", file.path.display()))?;
+    let mut pos = input.metadata()?.len();
+    let mut suffix = Vec::new();
+    while pos > 0 {
+        let size = pos.min(8192) as usize;
+        pos -= size as u64;
+        input.seek(SeekFrom::Start(pos))?;
+        let mut block = vec![0; size];
+        input.read_exact(&mut block)?;
+        block.extend_from_slice(&suffix);
+        let lines: Vec<_> = block.split(|b| *b == b'\n').collect();
+        for (i, line) in lines.into_iter().enumerate().rev() {
+            if i == 0 && pos > 0 {
+                break;
+            }
+            let line = trim_csv_line(line);
+            if !line.is_empty() {
+                // A header-only file has no data rows.
+                if has_header && pos == 0 && i == 0 {
+                    return Ok(None);
+                }
+                return parse_open_time_bytes(line)
+                    .map(Some)
+                    .with_context(|| format!("Bad last open_time in {}", file.path.display()));
+            }
+        }
+        suffix = block
+            .split(|b| *b == b'\n')
+            .next()
+            .unwrap_or_default()
+            .to_vec();
+    }
+    Ok(None)
 }
 
 fn trim_csv_line(mut line: &[u8]) -> &[u8] {
@@ -1324,29 +984,7 @@ fn parse_open_time_bytes(line: &[u8]) -> Result<i64> {
         .with_context(|| format!("invalid open_time: {}", raw))
 }
 
-fn should_skip_file(stats: &FileStats, resume_open_time: Option<i64>) -> bool {
-    match (stats.last_open_time, resume_open_time) {
-        (Some(file_last_open_time), Some(resume_open_time)) => {
-            file_last_open_time <= resume_open_time
-        }
-        _ => false,
-    }
-}
-
-fn max_open_time(conn: &Connection, table: &str) -> Result<Option<i64>> {
-    let sql = format!("SELECT MAX(open_time) FROM {}", table);
-    let mut stmt = conn.prepare(&sql)?;
-    let mut rows = stmt.query_map([], |row| row.get::<_, Option<i64>>(0))?;
-
-    match rows.next() {
-        Some(Ok(Some(open_time))) => Ok(Some(open_time)),
-        Some(Ok(None)) => Ok(None),
-        Some(Err(e)) => Err(anyhow::anyhow!("Failed to read MAX(open_time): {}", e)),
-        None => Ok(None),
-    }
-}
-
-fn create_table(conn: &Connection, table: &str, rsi_count: usize) -> Result<()> {
+fn create_table(conn: &Connection, table: &str, rsi_count: usize, dropped: &[usize]) -> Result<()> {
     let mut cols = vec![
         "open_time BIGINT NOT NULL".to_string(),
         "open DOUBLE NOT NULL".to_string(),
@@ -1362,6 +1000,11 @@ fn create_table(conn: &Connection, table: &str, rsi_count: usize) -> Result<()> 
         "ignore_col VARCHAR".to_string(),
     ];
 
+    cols = cols
+        .into_iter()
+        .enumerate()
+        .filter_map(|(i, col)| (!dropped.contains(&i)).then_some(col))
+        .collect();
     for i in 1..=rsi_count {
         cols.push(format!("rsi_{} DOUBLE", i));
     }
@@ -1374,261 +1017,67 @@ fn create_table(conn: &Connection, table: &str, rsi_count: usize) -> Result<()> 
     Ok(())
 }
 
-fn create_wide_table(conn: &Connection, table: &str) -> Result<()> {
-    let sql = format!(
-        "CREATE TABLE IF NOT EXISTS {} (open_time BIGINT PRIMARY KEY)",
-        quote_ident(table)
-    );
-    conn.execute_batch(&sql)?;
-    Ok(())
-}
-
-fn create_metadata_table(conn: &Connection) -> Result<()> {
-    let sql = format!(
-        "CREATE TABLE IF NOT EXISTS {} (currency VARCHAR NOT NULL PRIMARY KEY, start_column INTEGER NOT NULL, end_column INTEGER NOT NULL, first_open_time BIGINT NOT NULL)",
-        quote_ident(METADATA_TABLE)
-    );
-    conn.execute_batch(&sql)?;
-    Ok(())
-}
-
-fn create_staging_table(conn: &Connection, rsi_count: usize) -> Result<()> {
-    drop_staging_table(conn)?;
-
-    let mut cols = vec![
-        "open_time BIGINT NOT NULL".to_string(),
-        "open DOUBLE".to_string(),
-        "high DOUBLE".to_string(),
-        "low DOUBLE".to_string(),
-        "close DOUBLE".to_string(),
-        "volume DOUBLE".to_string(),
-        "close_time BIGINT".to_string(),
-        "quote_asset_volume DOUBLE".to_string(),
-        "number_of_trades BIGINT".to_string(),
-        "taker_buy_base_asset_volume DOUBLE".to_string(),
-        "taker_buy_quote_asset_volume DOUBLE".to_string(),
-        "ignore_col VARCHAR".to_string(),
-    ];
-
-    for i in 1..=rsi_count {
-        cols.push(format!("rsi_{} DOUBLE", i));
-    }
-
-    cols.push("PRIMARY KEY (open_time)".to_string());
-
-    let sql = format!(
-        "CREATE TABLE {} ({})",
-        quote_ident(STAGING_TABLE),
-        cols.join(", ")
-    );
-    conn.execute_batch(&sql)?;
-    Ok(())
-}
-
-fn drop_staging_table(conn: &Connection) -> Result<()> {
-    conn.execute_batch(&format!(
-        "DROP TABLE IF EXISTS {}",
-        quote_ident(STAGING_TABLE)
-    ))?;
-    Ok(())
-}
-
-fn import_symbol_to_staging(
-    conn: &Connection,
-    args: &Args,
-    job: &ImportJob,
-    rsi_count: usize,
-    file_stats: &[FileStats],
-    progress_ui: Arc<ProgressUi>,
-) -> Result<usize> {
-    let mut appender = conn
-        .appender(STAGING_TABLE)
-        .with_context(|| format!("Cannot create Appender for table {}", STAGING_TABLE))?;
-    let start = Instant::now();
-    let expected_rows = file_stats
-        .iter()
-        .map(|stats| stats.row_count)
-        .sum::<usize>();
-    let mut progress = progress_ui.start_job(&job.symbol, Some(expected_rows as u64));
-    let mut total_rows = 0usize;
-    let mut last_open_time = None;
-
-    for (file, stats) in job.files.iter().zip(file_stats.iter()) {
-        let file_name = file.path.file_name().unwrap().to_string_lossy().to_string();
-        let mut progress_slot = progress.acquire_slot(&file_name, Some(stats.row_count as u64));
-        let imported = import_file_with_appender(
-            file,
-            args,
-            rsi_count,
-            &mut appender,
-            conn,
-            &mut total_rows,
-            &mut last_open_time,
-            start,
-            &progress_slot,
-            None,
-        )?;
-        progress_slot.finish();
-        progress.println(format!("Staged {:>12} rows from {}", imported, file_name));
-    }
-
-    appender.flush()?;
-    progress.finish();
-
-    Ok(total_rows)
-}
-
-fn merge_staging_into_wide_table(
+fn validate_and_extend_row_schema(
     conn: &Connection,
     table: &str,
-    symbol: &str,
-    rsi_count: usize,
-) -> Result<SymbolMetadata> {
-    let first_open_time = min_open_time(conn, STAGING_TABLE)?
-        .with_context(|| format!("No staged rows found for {}", symbol))?;
-    let start_column = table_column_count(conn, table)? + 1;
-    let data_columns = data_column_specs(rsi_count);
-    let main_columns = symbol_data_column_names(symbol, rsi_count)?;
-
-    for ((_, sql_type), column_name) in data_columns.iter().zip(main_columns.iter()) {
-        let sql = format!(
-            "ALTER TABLE {} ADD COLUMN {} {}",
-            quote_ident(table),
-            quote_ident(column_name),
-            sql_type
-        );
-        conn.execute_batch(&sql)?;
-    }
-
-    conn.execute_batch(&format!(
-        "INSERT OR IGNORE INTO {} (open_time) SELECT open_time FROM {}",
-        quote_ident(table),
-        quote_ident(STAGING_TABLE)
-    ))?;
-
-    let assignments = data_columns
-        .iter()
-        .zip(main_columns.iter())
-        .map(|((source_name, _), target_name)| {
-            format!(
-                "{} = s.{}",
-                quote_ident(target_name),
-                quote_ident(source_name)
-            )
-        })
-        .collect::<Vec<_>>()
-        .join(", ");
-    let update_sql = format!(
-        "UPDATE {} AS k SET {} FROM {} AS s WHERE k.open_time = s.open_time",
-        quote_ident(table),
-        assignments,
-        quote_ident(STAGING_TABLE)
-    );
-    conn.execute_batch(&update_sql)?;
-
-    Ok(SymbolMetadata {
-        symbol: symbol.to_string(),
-        start_column,
-        end_column: start_column + main_columns.len() - 1,
-        first_open_time,
-    })
-}
-
-fn insert_symbol_metadata(conn: &Connection, metadata: &SymbolMetadata) -> Result<()> {
+    incoming_rsi: usize,
+    dropped: &[usize],
+) -> Result<usize> {
     let sql = format!(
-        "INSERT INTO {} (currency, start_column, end_column, first_open_time) VALUES (?1, ?2, ?3, ?4)",
-        quote_ident(METADATA_TABLE)
-    );
-    conn.execute(
-        &sql,
-        params![
-            metadata.symbol,
-            metadata.start_column as i64,
-            metadata.end_column as i64,
-            metadata.first_open_time
-        ],
-    )?;
-    Ok(())
-}
-
-fn metadata_has_symbol(conn: &Connection, symbol: &str) -> Result<bool> {
-    let sql = format!(
-        "SELECT COUNT(*) FROM {} WHERE currency = ?1",
-        quote_ident(METADATA_TABLE)
-    );
-    let mut stmt = conn.prepare(&sql)?;
-    let mut rows = stmt.query_map(params![symbol], |row| row.get::<_, i64>(0))?;
-    match rows.next() {
-        Some(Ok(count)) => Ok(count > 0),
-        Some(Err(err)) => Err(anyhow::anyhow!("Failed to read metadata: {}", err)),
-        None => Ok(false),
-    }
-}
-
-fn min_open_time(conn: &Connection, table: &str) -> Result<Option<i64>> {
-    let sql = format!("SELECT MIN(open_time) FROM {}", quote_ident(table));
-    let mut stmt = conn.prepare(&sql)?;
-    let mut rows = stmt.query_map([], |row| row.get::<_, Option<i64>>(0))?;
-    match rows.next() {
-        Some(Ok(open_time)) => Ok(open_time),
-        Some(Err(err)) => Err(anyhow::anyhow!("Failed to read MIN(open_time): {}", err)),
-        None => Ok(None),
-    }
-}
-
-fn table_column_count(conn: &Connection, table: &str) -> Result<usize> {
-    let sql = format!(
-        "SELECT COUNT(*) FROM pragma_table_info('{}')",
+        "SELECT name FROM pragma_table_info('{}') ORDER BY cid",
         escape_sql_string(table)
     );
     let mut stmt = conn.prepare(&sql)?;
-    let mut rows = stmt.query_map([], |row| row.get::<_, i64>(0))?;
-    match rows.next() {
-        Some(Ok(count)) => Ok(count as usize),
-        Some(Err(err)) => Err(anyhow::anyhow!("Failed to count table columns: {}", err)),
-        None => Ok(0),
+    let columns = stmt
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<duckdb::Result<Vec<_>>>()?;
+    let retained: Vec<&str> = COLUMN_NAMES
+        .iter()
+        .enumerate()
+        .filter_map(|(i, name)| (!dropped.contains(&i)).then_some(*name))
+        .collect();
+    let remaining: Vec<&str> = columns
+        .iter()
+        .map(String::as_str)
+        .filter(|name| !dropped.iter().any(|i| COLUMN_NAMES[*i] == *name))
+        .collect();
+    if remaining.len() < retained.len() || remaining[..retained.len()] != retained {
+        bail!(
+            "table {table} has an incompatible column layout; changing retained columns requires a rebuild"
+        );
     }
-}
-
-fn data_column_specs(rsi_count: usize) -> Vec<(String, &'static str)> {
-    let mut cols = vec![
-        ("open".to_string(), "DOUBLE"),
-        ("high".to_string(), "DOUBLE"),
-        ("low".to_string(), "DOUBLE"),
-        ("close".to_string(), "DOUBLE"),
-        ("volume".to_string(), "DOUBLE"),
-        ("close_time".to_string(), "BIGINT"),
-        ("quote_asset_volume".to_string(), "DOUBLE"),
-        ("number_of_trades".to_string(), "BIGINT"),
-        ("taker_buy_base_asset_volume".to_string(), "DOUBLE"),
-        ("taker_buy_quote_asset_volume".to_string(), "DOUBLE"),
-        ("ignore_col".to_string(), "VARCHAR"),
-    ];
-
-    for i in 1..=rsi_count {
-        cols.push((format!("rsi_{}", i), "DOUBLE"));
+    let existing = remaining.len() - retained.len();
+    for (i, name) in remaining[retained.len()..].iter().enumerate() {
+        if *name != format!("rsi_{}", i + 1) {
+            bail!("table {table} has incompatible RSI columns");
+        }
     }
-
-    cols
-}
-
-fn symbol_data_column_names(symbol: &str, rsi_count: usize) -> Result<Vec<String>> {
-    validate_ident(symbol)?;
-    Ok(data_column_specs(rsi_count)
-        .into_iter()
-        .map(|(name, _)| format!("{}_{}", symbol, name))
-        .collect())
-}
-
-fn quote_ident(ident: &str) -> String {
-    format!("\"{}\"", ident.replace('"', "\"\""))
+    // Existing databases may contain columns that are now excluded. Drop them explicitly.
+    drop(stmt);
+    for &index in dropped {
+        if columns.iter().any(|col| col == COLUMN_NAMES[index]) {
+            conn.execute_batch(&format!(
+                "ALTER TABLE {table} DROP COLUMN {}",
+                COLUMN_NAMES[index]
+            ))?;
+        }
+    }
+    for i in existing + 1..=incoming_rsi {
+        conn.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN rsi_{i} DOUBLE"))?;
+    }
+    Ok(existing.max(incoming_rsi))
 }
 
 fn escape_sql_string(value: &str) -> String {
     value.replace('\'', "''")
 }
 
-fn build_insert_sql(table: &str, rsi_count: usize, replace_existing: bool) -> String {
+fn build_insert_sql(
+    table: &str,
+    rsi_count: usize,
+    replace_existing: bool,
+    dropped: &[usize],
+) -> String {
     let mut cols = vec![
         "open_time",
         "open",
@@ -1647,6 +1096,11 @@ fn build_insert_sql(table: &str, rsi_count: usize, replace_existing: bool) -> St
     .map(String::from)
     .collect::<Vec<_>>();
 
+    cols = cols
+        .into_iter()
+        .enumerate()
+        .filter_map(|(i, col)| (!dropped.contains(&i)).then_some(col))
+        .collect();
     for i in 1..=rsi_count {
         cols.push(format!("rsi_{}", i));
     }
@@ -1675,15 +1129,16 @@ fn import_file_with_appender(
     args: &Args,
     rsi_count: usize,
     appender: &mut Appender,
+    dropped: &[usize],
     _conn: &Connection,
     total_rows: &mut usize,
     last_open_time: &mut Option<i64>,
     start: Instant,
     progress: &ProgressSlot,
-    resume_open_time: Option<i64>,
 ) -> Result<usize> {
     let mut reader = ReaderBuilder::new()
         .has_headers(args.has_header)
+        .flexible(args.ignore_extra_columns)
         .from_path(&file.path)
         .with_context(|| format!("Cannot open {}", file.path.display()))?;
 
@@ -1698,33 +1153,22 @@ fn import_file_with_appender(
 
         let open_time = parse_i64(&record, 0, "open_time")?;
 
-        if resume_open_time.is_some_and(|resume_open_time| open_time <= resume_open_time) {
-            pending_progress += 1;
-            if pending_progress >= PROGRESS_FLUSH_ROWS {
-                progress.inc(pending_progress);
-                pending_progress = 0;
-            }
-            *last_open_time = Some(open_time);
-            continue;
+        if !args.skip_order_check
+            && let Some(prev_open_time) = *last_open_time
+            && open_time <= prev_open_time
+        {
+            bail!(
+                "open_time is not strictly increasing: previous={}, current={} in {}",
+                prev_open_time,
+                open_time,
+                file.path.display()
+            );
         }
 
-        if !args.skip_order_check {
-            if let Some(prev_open_time) = *last_open_time {
-                if open_time <= prev_open_time {
-                    bail!(
-                        "open_time is not strictly increasing: previous={}, current={} in {}",
-                        prev_open_time,
-                        open_time,
-                        file.path.display()
-                    );
-                }
-            }
-        }
-
-        let row = record_to_row(&record, rsi_count)
+        let row = record_to_row(&record, rsi_count, args.ignore_extra_columns)
             .with_context(|| format!("Bad row in {}", file.path.display()))?;
 
-        append_row_to_appender(appender, &row)?;
+        append_row_to_appender(appender, &row, dropped)?;
 
         *last_open_time = Some(row.open_time);
         file_rows += 1;
@@ -1736,11 +1180,13 @@ fn import_file_with_appender(
             pending_progress = 0;
         }
 
-        if matches!(args.import_mode, ImportMode::Balanced) && *total_rows % args.batch_size == 0 {
+        if matches!(args.import_mode, ImportMode::Balanced)
+            && (*total_rows).is_multiple_of(args.batch_size)
+        {
             appender.flush()?;
         }
 
-        if *total_rows % args.progress_every == 0 {
+        if (*total_rows).is_multiple_of(args.progress_every) {
             let elapsed = start.elapsed().as_secs_f64();
             let rows_per_sec = *total_rows as f64 / elapsed.max(0.001);
 
@@ -1758,27 +1204,37 @@ fn import_file_with_appender(
     Ok(file_rows)
 }
 
-fn append_row_to_appender(appender: &mut Appender, row: &ParsedRow) -> Result<()> {
-    let mut params: Vec<Box<dyn ToSql>> = Vec::with_capacity(12 + row.rsi_values.len());
-    params.push(Box::new(row.open_time) as Box<dyn ToSql>);
-    params.push(Box::new(row.open) as Box<dyn ToSql>);
-    params.push(Box::new(row.high) as Box<dyn ToSql>);
-    params.push(Box::new(row.low) as Box<dyn ToSql>);
-    params.push(Box::new(row.close) as Box<dyn ToSql>);
-    params.push(Box::new(row.volume) as Box<dyn ToSql>);
-    params.push(Box::new(row.close_time) as Box<dyn ToSql>);
-    params.push(Box::new(row.quote_asset_volume) as Box<dyn ToSql>);
-    params.push(Box::new(row.number_of_trades) as Box<dyn ToSql>);
-    params.push(Box::new(row.taker_buy_base_asset_volume) as Box<dyn ToSql>);
-    params.push(Box::new(row.taker_buy_quote_asset_volume) as Box<dyn ToSql>);
-    params.push(Box::new(row.ignore_col.clone()) as Box<dyn ToSql>);
+fn row_params<'a>(
+    row: &'a ParsedRow<'a>,
+    dropped: &'a [usize],
+) -> impl Iterator<Item = &'a dyn ToSql> + 'a {
+    let columns: [&dyn ToSql; 12] = [
+        &row.open_time,
+        &row.open,
+        &row.high,
+        &row.low,
+        &row.close,
+        &row.volume,
+        &row.close_time,
+        &row.quote_asset_volume,
+        &row.number_of_trades,
+        &row.taker_buy_base_asset_volume,
+        &row.taker_buy_quote_asset_volume,
+        &row.ignore_col,
+    ];
+    columns
+        .into_iter()
+        .enumerate()
+        .filter_map(move |(i, value)| (!dropped.contains(&i)).then_some(value))
+        .chain(row.rsi_values.iter().map(|value| value as &dyn ToSql))
+}
 
-    for rsi in &row.rsi_values {
-        params.push(Box::new(*rsi) as Box<dyn ToSql>);
-    }
-
-    let refs: Vec<&dyn ToSql> = params.iter().map(|v| v.as_ref()).collect();
-    appender.append_row(appender_params_from_iter(refs.iter().copied()))?;
+fn append_row_to_appender(
+    appender: &mut Appender,
+    row: &ParsedRow,
+    dropped: &[usize],
+) -> Result<()> {
+    appender.append_row(appender_params_from_iter(row_params(row, dropped)))?;
     Ok(())
 }
 
@@ -1787,15 +1243,16 @@ fn import_file_with_prepared_stmt(
     args: &Args,
     rsi_count: usize,
     stmt: &mut duckdb::Statement,
+    dropped: &[usize],
     conn: &Connection,
     total_rows: &mut usize,
     last_open_time: &mut Option<i64>,
     start: Instant,
     progress: &ProgressSlot,
-    resume_open_time: Option<i64>,
 ) -> Result<usize> {
     let mut reader = ReaderBuilder::new()
         .has_headers(args.has_header)
+        .flexible(args.ignore_extra_columns)
         .from_path(&file.path)
         .with_context(|| format!("Cannot open {}", file.path.display()))?;
 
@@ -1808,37 +1265,22 @@ fn import_file_with_prepared_stmt(
             continue;
         }
 
-        let open_time = parse_i64(&record, 0, "open_time")?;
-
-        if resume_open_time.is_some_and(|resume_open_time| open_time <= resume_open_time) {
-            pending_progress += 1;
-            if pending_progress >= PROGRESS_FLUSH_ROWS {
-                progress.inc(pending_progress);
-                pending_progress = 0;
-            }
-            *last_open_time = Some(open_time);
-            continue;
-        }
-
-        let row = record_to_row(&record, rsi_count)
+        let row = record_to_row(&record, rsi_count, args.ignore_extra_columns)
             .with_context(|| format!("Bad row in {}", file.path.display()))?;
 
-        if !args.skip_order_check {
-            if let Some(prev_open_time) = *last_open_time {
-                if row.open_time <= prev_open_time {
-                    bail!(
-                        "open_time is not strictly increasing: previous={}, current={} in {}",
-                        prev_open_time,
-                        row.open_time,
-                        file.path.display()
-                    );
-                }
-            }
+        if !args.skip_order_check
+            && let Some(prev_open_time) = *last_open_time
+            && row.open_time <= prev_open_time
+        {
+            bail!(
+                "open_time is not strictly increasing: previous={}, current={} in {}",
+                prev_open_time,
+                row.open_time,
+                file.path.display()
+            );
         }
 
-        let params = row_to_params(&row);
-        let refs: Vec<&dyn ToSql> = params.iter().map(|v| v.as_ref()).collect();
-        stmt.execute(duckdb::params_from_iter(refs.iter().copied()))?;
+        stmt.execute(duckdb::params_from_iter(row_params(&row, dropped)))?;
 
         *last_open_time = Some(row.open_time);
         file_rows += 1;
@@ -1850,12 +1292,12 @@ fn import_file_with_prepared_stmt(
             pending_progress = 0;
         }
 
-        if *total_rows % args.batch_size == 0 {
+        if (*total_rows).is_multiple_of(args.batch_size) {
             conn.execute_batch("COMMIT")?;
             conn.execute_batch("BEGIN")?;
         }
 
-        if *total_rows % args.progress_every == 0 {
+        if (*total_rows).is_multiple_of(args.progress_every) {
             let elapsed = start.elapsed().as_secs_f64();
             let rows_per_sec = *total_rows as f64 / elapsed.max(0.001);
 
@@ -1873,7 +1315,11 @@ fn import_file_with_prepared_stmt(
     Ok(file_rows)
 }
 
-fn record_to_row(record: &StringRecord, rsi_count: usize) -> Result<ParsedRow> {
+fn record_to_row<'a>(
+    record: &'a StringRecord,
+    rsi_count: usize,
+    ignore_extra_columns: bool,
+) -> Result<ParsedRow<'a>> {
     if record.len() < BINANCE_COLS {
         bail!(
             "row has {} columns, expected at least {}",
@@ -1893,12 +1339,16 @@ fn record_to_row(record: &StringRecord, rsi_count: usize) -> Result<ParsedRow> {
     let number_of_trades = parse_i64(record, 8, "number_of_trades")?;
     let taker_buy_base_asset_volume = parse_f64(record, 9, "taker_buy_base_asset_volume")?;
     let taker_buy_quote_asset_volume = parse_f64(record, 10, "taker_buy_quote_asset_volume")?;
-    let ignore_col = record.get(11).unwrap_or("").to_string();
+    let ignore_col = record.get(11).unwrap_or("");
 
     let mut rsi_values = Vec::with_capacity(rsi_count);
     for i in 0..rsi_count {
         let idx = BINANCE_COLS + i;
-        let value = match record.get(idx) {
+        let value = match if ignore_extra_columns {
+            None
+        } else {
+            record.get(idx)
+        } {
             Some(s) if !s.trim().is_empty() => Some(s.parse::<f64>()?),
             _ => None,
         };
@@ -1920,28 +1370,6 @@ fn record_to_row(record: &StringRecord, rsi_count: usize) -> Result<ParsedRow> {
         ignore_col,
         rsi_values,
     })
-}
-
-fn row_to_params(row: &ParsedRow) -> Vec<Box<dyn ToSql>> {
-    let mut params: Vec<Box<dyn ToSql>> = Vec::with_capacity(12 + row.rsi_values.len());
-    params.push(Box::new(row.open_time));
-    params.push(Box::new(row.open));
-    params.push(Box::new(row.high));
-    params.push(Box::new(row.low));
-    params.push(Box::new(row.close));
-    params.push(Box::new(row.volume));
-    params.push(Box::new(row.close_time));
-    params.push(Box::new(row.quote_asset_volume));
-    params.push(Box::new(row.number_of_trades));
-    params.push(Box::new(row.taker_buy_base_asset_volume));
-    params.push(Box::new(row.taker_buy_quote_asset_volume));
-    params.push(Box::new(row.ignore_col.clone()));
-
-    for rsi in &row.rsi_values {
-        params.push(Box::new(*rsi));
-    }
-
-    params
 }
 
 fn parse_i64(record: &StringRecord, idx: usize, name: &str) -> Result<i64> {
@@ -1972,4 +1400,273 @@ fn validate_ident(name: &str) -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn skips_covered_files_and_replaces_first_overlap_then_appends() {
+        for mode in ["balanced", "safe"] {
+            let root = std::env::temp_dir().join(format!(
+                "csv-resume-{}-{}-{mode}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            fs::create_dir_all(&root).unwrap();
+            let db = root.join("TEST.duckdb");
+            let conn = Connection::open(&db).unwrap();
+            create_table(&conn, "klines", 1, &[]).unwrap();
+            conn.execute_batch("INSERT INTO klines VALUES (1,1,1,1,1,1,1,1,1,1,1,'0',50), (2,2,2,2,2,2,2,2,2,2,2,'0',60)").unwrap();
+            drop(conn);
+            let old = root.join("TEST-1s-2024-01.csv");
+            let overlap = root.join("TEST-1s-2024-02.csv");
+            let next = root.join("TEST-1s-2024-03.csv");
+            // The old file has a malformed body, proving it is not scanned during resume.
+            fs::write(&old, "bad historical data\n1,1,1,1,1,1,1,1,1,1,1,0\n").unwrap();
+            fs::write(
+                &overlap,
+                "2,9,9,9,9,9,2,9,9,9,9,0\n3,3,3,3,3,3,3,3,3,3,3,0\n",
+            )
+            .unwrap();
+            fs::write(&next, "4,4,4,4,4,4,4,4,4,4,4,0\n").unwrap();
+            let args = Args::parse_from([
+                "csv-to-duckdb",
+                "--dir",
+                root.to_str().unwrap(),
+                "--ignore-extra-columns",
+                "--import-mode",
+                mode,
+            ]);
+            let job = ImportJob {
+                dir: root.clone(),
+                db_path: db.clone(),
+                symbol: "TEST".into(),
+                interval: "1s".into(),
+                files: vec![
+                    CsvFile {
+                        path: old.clone(),
+                        year: 2024,
+                        month: 1,
+                    },
+                    CsvFile {
+                        path: overlap,
+                        year: 2024,
+                        month: 2,
+                    },
+                    CsvFile {
+                        path: next,
+                        year: 2024,
+                        month: 3,
+                    },
+                ],
+            };
+            run_import_job(&args, job, ProgressUi::new()).unwrap();
+            let conn = Connection::open(&db).unwrap();
+            assert_eq!(
+                conn.query_row("SELECT count(*) FROM klines", [], |r| r.get::<_, i64>(0))
+                    .unwrap(),
+                4
+            );
+            assert_eq!(
+                conn.query_row("SELECT close FROM klines WHERE open_time=2", [], |r| r
+                    .get::<_, f64>(0))
+                    .unwrap(),
+                9.0
+            );
+            assert_eq!(
+                conn.query_row(
+                    "SELECT count(*) FROM pragma_table_info('klines') WHERE name='ignore_col'",
+                    [],
+                    |r| r.get::<_, i64>(0)
+                )
+                .unwrap(),
+                0
+            );
+            assert!(old.exists());
+            drop(conn);
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn validates_column_selection() {
+        let args = Args::parse_from(["csv-to-duckdb", "--drop-columns", "ignore,volume"]);
+        assert_eq!(dropped_columns(&args).unwrap(), vec![11, 5]);
+        let args = Args::parse_from(["csv-to-duckdb", "--drop-columns", "close"]);
+        assert!(dropped_columns(&args).is_err());
+    }
+
+    #[test]
+    fn completed_file_is_committed_if_later_file_fails() {
+        let root = std::env::temp_dir().join(format!(
+            "csv-partial-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let db = root.join("TEST.duckdb");
+        let first = root.join("TEST-1s-2024-01.csv");
+        let second = root.join("TEST-1s-2024-02.csv");
+        fs::write(&first, "1,1,1,1,1,1,1,1,1,1,1,0\n").unwrap();
+        fs::write(&second, "2,invalid\n").unwrap();
+        let args = Args::parse_from([
+            "csv-to-duckdb",
+            "--dir",
+            root.to_str().unwrap(),
+            "--report-file-progress",
+            "--ignore-extra-columns",
+        ]);
+        let job = ImportJob {
+            dir: root.clone(),
+            db_path: db.clone(),
+            symbol: "TEST".into(),
+            interval: "1s".into(),
+            files: vec![
+                CsvFile {
+                    path: first,
+                    year: 2024,
+                    month: 1,
+                },
+                CsvFile {
+                    path: second,
+                    year: 2024,
+                    month: 2,
+                },
+            ],
+        };
+        assert!(run_import_job(&args, job, ProgressUi::new()).is_err());
+        let conn = Connection::open(&db).unwrap();
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM klines", [], |row| row
+                .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        drop(conn);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn ignore_extra_columns_handles_mixed_width_and_existing_rsi_schema() {
+        let root = std::env::temp_dir().join(format!(
+            "csv-raw-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let db = root.join("TEST.duckdb");
+        let csv = root.join("TEST-1s-2024-01.csv");
+        let conn = Connection::open(&db).unwrap();
+        create_table(&conn, "klines", 1, &[]).unwrap();
+        drop(conn);
+        fs::write(
+            &csv,
+            "1,1,1,1,1,1,1,1,1,1,1,0,not-rsi\n2,2,2,2,2,2,2,2,2,2,2,0\n",
+        )
+        .unwrap();
+        let args = Args::parse_from([
+            "csv-to-duckdb",
+            "--dir",
+            root.to_str().unwrap(),
+            "--ignore-extra-columns",
+        ]);
+        let job = ImportJob {
+            dir: root.clone(),
+            db_path: db.clone(),
+            symbol: "TEST".into(),
+            interval: "1s".into(),
+            files: vec![CsvFile {
+                path: csv.clone(),
+                year: 2024,
+                month: 1,
+            }],
+        };
+        run_import_job(&args, job, ProgressUi::new()).unwrap();
+        let conn = Connection::open(&db).unwrap();
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM klines WHERE rsi_1 IS NULL",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+            2
+        );
+        drop(conn);
+        assert!(fs::read_to_string(csv).unwrap().contains("not-rsi"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn explicit_replacement_reimports_covered_files() {
+        let root = std::env::temp_dir().join(format!(
+            "csv-duckdb-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let db = root.join("TEST.duckdb");
+        let csv = root.join("TEST-1s-2024-01.csv");
+        let conn = Connection::open(&db).unwrap();
+        create_table(&conn, "klines", 1, &[]).unwrap();
+        conn.execute_batch("INSERT INTO klines VALUES (1,1,1,1,1,1,1,1,1,1,1,'0',50), (3,3,3,3,3,3,3,3,3,3,3,'0',60)").unwrap();
+        drop(conn);
+        fs::write(
+            &csv,
+            "1,9,9,9,9,9,1,9,9,9,9,0\n2,2,2,2,2,2,2,2,2,2,2,0\n3,9,9,9,9,9,3,9,9,9,9,0\n",
+        )
+        .unwrap();
+        let args = Args::parse_from(["csv-to-duckdb", "--dir", root.to_str().unwrap()]);
+        let job = || ImportJob {
+            dir: root.clone(),
+            db_path: db.clone(),
+            symbol: "TEST".into(),
+            interval: "1s".into(),
+            files: vec![CsvFile {
+                path: csv.clone(),
+                year: 2024,
+                month: 1,
+            }],
+        };
+        run_import_job(&args, job(), ProgressUi::new()).unwrap();
+        let conn = Connection::open(&db).unwrap();
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM klines", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            2
+        );
+        assert_eq!(
+            conn.query_row("SELECT close FROM klines WHERE open_time=1", [], |r| r
+                .get::<_, f64>(0))
+                .unwrap(),
+            1.0
+        );
+        drop(conn);
+        let mut replace = args.clone();
+        replace.replace_existing = true;
+        run_import_job(&replace, job(), ProgressUi::new()).unwrap();
+        let conn = Connection::open(&db).unwrap();
+        assert_eq!(
+            conn.query_row("SELECT close FROM klines WHERE open_time=1", [], |r| r
+                .get::<_, f64>(0))
+                .unwrap(),
+            9.0
+        );
+        drop(conn);
+        fs::remove_dir_all(root).unwrap();
+    }
 }
