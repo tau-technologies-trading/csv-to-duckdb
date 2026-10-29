@@ -114,7 +114,7 @@ jobs:
       - name: Download binaries
         uses: actions/download-artifact@v8.0.1
         with:
-          path: artifacts
+          path: ${{ runner.temp }}/release-artifacts
 
       - name: Package release assets
         env:
@@ -129,7 +129,8 @@ jobs:
 
           tag = os.environ["RELEASE_TAG"]
           binary_name = os.environ["BINARY_NAME"]
-          dist = Path("dist")
+          artifacts = Path(os.environ["RUNNER_TEMP"]) / "release-artifacts"
+          dist = Path(os.environ["RUNNER_TEMP"]) / "release-dist"
           dist.mkdir(exist_ok=True)
 
           unix_targets = [
@@ -145,7 +146,7 @@ jobs:
           ]
 
           for target in unix_targets:
-              source = Path("artifacts") / f"{binary_name}-{target}" / binary_name
+              source = artifacts / f"{binary_name}-{target}" / binary_name
               archive = dist / f"{binary_name}-{tag}-{target}.tar.gz"
 
               if not source.exists():
@@ -159,8 +160,8 @@ jobs:
                       tar.addfile(info, binary)
 
           for target in windows_targets:
-              source = Path("artifacts") / f"{binary_name}-{target}" / f"{binary_name}.exe"
-              duckdb_dll = Path("artifacts") / f"{binary_name}-{target}" / "duckdb.dll"
+              source = artifacts / f"{binary_name}-{target}" / f"{binary_name}.exe"
+              duckdb_dll = artifacts / f"{binary_name}-{target}" / "duckdb.dll"
               archive = dist / f"{binary_name}-{tag}-{target}.zip"
 
               if not source.exists():
@@ -208,7 +209,7 @@ jobs:
             if [ "${commits_found}" = false ]; then
               printf '%s\n' '- No commits found.'
             fi
-          } > release-notes.md
+          } > "$RUNNER_TEMP/release-notes.md"
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -222,6 +223,6 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "${{ steps.version.outputs.tag }}" dist/* \
+          gh release create "${{ steps.version.outputs.tag }}" "$RUNNER_TEMP"/release-dist/* \
             --title "${{ steps.version.outputs.tag }}" \
-            --notes-file release-notes.md
+            --notes-file "$RUNNER_TEMP/release-notes.md"
