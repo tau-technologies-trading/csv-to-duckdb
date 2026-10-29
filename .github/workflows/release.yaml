@@ -65,7 +65,11 @@ jobs:
         if: matrix.windows == true
         shell: pwsh
         run: |
-          Copy-Item "target/${{ matrix.target }}/release/deps/duckdb.dll" "target/${{ matrix.target }}/release/duckdb.dll"
+          $dlls = @(Get-ChildItem -Path "target/${{ matrix.target }}/duckdb-download/${{ matrix.target }}" -Filter duckdb.dll -File -Recurse)
+          if ($dlls.Count -ne 1) {
+            throw "Expected exactly one DuckDB DLL for ${{ matrix.target }}, found $($dlls.Count)"
+          }
+          Copy-Item $dlls[0].FullName "target/${{ matrix.target }}/release/duckdb.dll"
 
       - name: Upload binary
         if: matrix.windows != true
