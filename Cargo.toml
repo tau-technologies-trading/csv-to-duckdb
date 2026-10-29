@@ -19,7 +19,7 @@ csv = "1.4.0"
 indicatif = "0.18"
 
 [target.'cfg(not(windows))'.dependencies]
-duckdb = { version = "1.10504", features = ["bundled"] }
+duckdb = { version = "~1.20000.1", features = ["bundled"] }
 
 [target.'cfg(windows)'.dependencies]
-duckdb = "1.10504"
+duckdb = "~1.20000.1"
