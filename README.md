@@ -7,7 +7,7 @@ Library for importing one directory of Binance Vision kline CSVs into one DuckDB
 Add the crate to your Rust project:
 
 ```toml
-csv-to-duckdb = "1.1.1"
+csv-to-duckdb = "1.1.2"
 ```
 
 Import a folder with `ImportOptions`. The callback runs once for each file imported or skipped:
