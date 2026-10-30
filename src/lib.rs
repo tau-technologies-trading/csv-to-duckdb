@@ -1,9 +1,7 @@
 use anyhow::{Context, Result, bail};
-use clap::{Parser, ValueEnum};
 use csv::{ReaderBuilder, StringRecord};
 use duckdb::{Appender, Connection, appender_params_from_iter, types::ToSql};
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
-use std::ffi::OsString;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -13,11 +11,8 @@ use std::time::Instant;
 
 const BINANCE_COLS: usize = 12;
 const PROGRESS_FLUSH_ROWS: u64 = 8192;
-const DEFAULT_SINGLE_DIR: &str = "../data/BTCUSDT/";
-const DEFAULT_SINGLE_DB: &str = "../db/BTCUSDT/BTCUSDT.duckdb";
-
-#[derive(Debug, Clone, Copy, ValueEnum)]
-enum ImportMode {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ImportMode {
     /// Maximum crash safety. Uses row-by-row prepared statements with periodic commits. Slower.
     Safe,
 
@@ -35,87 +30,55 @@ enum RecreateAction {
     DropTableOnly,
 }
 
-#[derive(Parser, Debug)]
-#[command(
-    about = "Import Binance Vision CSV files into a local DuckDB database",
-    long_about = "Import one folder of Binance Vision CSVs into a DuckDB database. Files are processed chronologically; --jobs controls parallel file inspection. Files ending at or before the database maximum are skipped; the first extending file replaces overlaps.",
-    version,
-    disable_version_flag = true,
-    after_help = "Examples:\n  csv-to-duckdb --dir ../data/BTCUSDT --db ../db/BTCUSDT/BTCUSDT.duckdb --jobs 4\n  csv-to-duckdb --auto 3\n  csv-to-duckdb --ignore-extra-columns\n  csv-to-duckdb --replace-existing"
-)]
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 struct Args {
     /// Directory containing files like BTCUSDT-1s-2026-04.csv
-    #[arg(short, long, default_value = DEFAULT_SINGLE_DIR)]
     dir: PathBuf,
 
     /// Output DuckDB database path
-    #[arg(short = 'o', long, default_value = DEFAULT_SINGLE_DB)]
     db: String,
 
     /// Interval per row
-    #[arg(short, long, default_value = "1s")]
     interval: String,
 
     /// SQL table name
-    #[arg(short, long, default_value = "klines")]
     table: String,
 
     /// Commit every N rows (only used in safe mode)
-    #[arg(short, long, default_value_t = 250_000)]
     batch_size: usize,
 
     /// Print progress every N rows
-    #[arg(long, default_value_t = 1_000_000)]
     progress_every: usize,
 
     /// CSV has a header row
-    #[arg(long, default_value_t = false)]
     has_header: bool,
 
     /// Ignore all CSV columns after the 12 standard Binance kline columns.
-    #[arg(long, default_value_t = false)]
     ignore_extra_columns: bool,
 
     /// Comma-separated Binance columns to omit (use an empty value to keep all).
-    #[arg(long, default_value = "ignore")]
     drop_columns: String,
 
     /// Delete DB file and recreate from scratch before importing
-    #[arg(long, default_value_t = false)]
     recreate: bool,
 
     /// Recreate efficiently while preserving other user tables when present
-    #[arg(long, default_value_t = false)]
     recreate_pragmatic: bool,
 
     /// Import durability/speed mode (safe=prepared stmts, balanced=Appender+flush, unsafe=Appender)
-    #[arg(long, value_enum, default_value = "balanced")]
     import_mode: ImportMode,
 
     /// Replace existing rows instead of skipping duplicates. Use only when recomputing columns.
-    #[arg(long, default_value_t = false)]
     replace_existing: bool,
 
     /// Do not fail if CSV open_time values are not strictly increasing
-    #[arg(long, default_value_t = false)]
     skip_order_check: bool,
 
     /// Import only the newest N matching CSV files
-    #[arg(long)]
     auto: Option<usize>,
 
     /// Maximum number of CSV files to inspect concurrently.
-    #[arg(long, default_value_t = 4)]
     jobs: usize,
-
-    /// Emit a machine-readable marker after each file is imported or skipped.
-    #[arg(long, default_value_t = false)]
-    report_file_progress: bool,
-
-    /// Print version information and exit.
-    #[arg(short = 'v', long = "version", action = clap::ArgAction::SetTrue, required = false)]
-    version_flag: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -245,32 +208,71 @@ pub struct ImportOptions {
     pub dir: PathBuf,
     pub db: PathBuf,
     pub interval: String,
+    pub table: String,
+    pub batch_size: usize,
+    pub progress_every: usize,
+    pub has_header: bool,
     pub jobs: usize,
+    pub import_mode: ImportMode,
     pub ignore_extra_columns: bool,
     pub drop_columns: String,
+    pub recreate: bool,
+    pub recreate_pragmatic: bool,
+    pub replace_existing: bool,
+    pub skip_order_check: bool,
+    pub auto: Option<usize>,
+}
+
+impl ImportOptions {
+    /// Create options for one folder import with the standard importer defaults.
+    pub fn new(
+        dir: impl Into<PathBuf>,
+        db: impl Into<PathBuf>,
+        interval: impl Into<String>,
+    ) -> Self {
+        Self {
+            dir: dir.into(),
+            db: db.into(),
+            interval: interval.into(),
+            table: "klines".into(),
+            batch_size: 250_000,
+            progress_every: 1_000_000,
+            has_header: false,
+            jobs: 4,
+            import_mode: ImportMode::Balanced,
+            ignore_extra_columns: false,
+            drop_columns: "ignore".into(),
+            recreate: false,
+            recreate_pragmatic: false,
+            replace_existing: false,
+            skip_order_check: false,
+            auto: None,
+        }
+    }
 }
 
 /// Import a single CSV folder into one DuckDB database.
 ///
 /// `on_file_completed` is called once for each file imported or skipped.
 pub fn import_folder(options: ImportOptions, mut on_file_completed: impl FnMut()) -> Result<()> {
-    let mut cli_args = vec![
-        OsString::from("csv-to-duckdb"),
-        OsString::from("--dir"),
-        options.dir.into_os_string(),
-        OsString::from("--db"),
-        options.db.into_os_string(),
-        OsString::from("--interval"),
-        OsString::from(options.interval),
-        OsString::from("--jobs"),
-        OsString::from(options.jobs.to_string()),
-        OsString::from("--drop-columns"),
-        OsString::from(options.drop_columns),
-    ];
-    if options.ignore_extra_columns {
-        cli_args.push(OsString::from("--ignore-extra-columns"));
-    }
-    let args = Args::try_parse_from(cli_args)?;
+    let args = Args {
+        dir: options.dir,
+        db: options.db.to_string_lossy().into_owned(),
+        interval: options.interval,
+        table: options.table,
+        batch_size: options.batch_size,
+        progress_every: options.progress_every,
+        has_header: options.has_header,
+        ignore_extra_columns: options.ignore_extra_columns,
+        drop_columns: options.drop_columns,
+        recreate: options.recreate,
+        recreate_pragmatic: options.recreate_pragmatic,
+        import_mode: options.import_mode,
+        replace_existing: options.replace_existing,
+        skip_order_check: options.skip_order_check,
+        auto: options.auto,
+        jobs: options.jobs,
+    };
     validate_args(&args)?;
     validate_ident(&args.table)?;
     let job = import_job_for_single_directory(&args.dir, PathBuf::from(&args.db), &args.interval)?;
@@ -387,27 +389,7 @@ fn truncate_progress_prefix(name: &str) -> String {
     name.chars().take(MAX_LEN).collect()
 }
 
-/// Run the `csv-to-duckdb` command-line interface.
-pub fn run_cli() -> Result<()> {
-    if std::env::args_os()
-        .skip(1)
-        .any(|arg| arg == "-v" || arg == "--version")
-    {
-        print_version();
-        return Ok(());
-    }
-
-    if std::env::args().len() == 1 {
-        bail!("no arguments provided; use --help for usage");
-    }
-
-    let args = Args::parse();
-    validate_args(&args)?;
-    validate_ident(&args.table)?;
-    let job = import_job_for_single_directory(&args.dir, PathBuf::from(&args.db), &args.interval)?;
-    run_import_job(&args, job, ProgressUi::new())
-}
-
+#[cfg(test)]
 fn run_import_job(args: &Args, job: ImportJob, progress_ui: Arc<ProgressUi>) -> Result<()> {
     run_import_job_with_callback(args, job, progress_ui, &mut || {})
 }
@@ -481,9 +463,6 @@ fn run_import_job_with_callback(
                 "Skipped {} (already covered by database)",
                 file.path.display()
             ));
-            if args.report_file_progress {
-                println!("@@CSV_FILE_IMPORTED@@");
-            }
             on_file_completed();
         } else {
             selected.push(file.clone());
@@ -616,9 +595,6 @@ fn import_all_files_with_appender(
         progress_slot.finish();
 
         progress.println(format!("Imported {:>12} rows from {}", imported, file_name));
-        if args.report_file_progress {
-            println!("@@CSV_FILE_IMPORTED@@");
-        }
         on_file_completed();
     }
 
@@ -669,19 +645,12 @@ fn import_all_files_with_prepared_stmts(
 
         progress.println(format!("Imported {:>12} rows from {}", imported, file_name));
         conn.execute_batch("COMMIT")?;
-        if args.report_file_progress {
-            println!("@@CSV_FILE_IMPORTED@@");
-        }
         on_file_completed();
         conn.execute_batch("BEGIN")?;
     }
 
     conn.execute_batch("COMMIT")?;
     Ok(())
-}
-
-fn print_version() {
-    println!("{} {}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
 }
 
 fn validate_args(args: &Args) -> Result<()> {
@@ -1462,11 +1431,32 @@ fn validate_ident(name: &str) -> Result<()> {
 mod tests {
     use super::*;
 
+    fn test_args(dir: &Path) -> Args {
+        Args {
+            dir: dir.to_path_buf(),
+            db: dir.join("TEST.duckdb").to_string_lossy().into_owned(),
+            interval: "1s".into(),
+            table: "klines".into(),
+            batch_size: 250_000,
+            progress_every: 1_000_000,
+            has_header: false,
+            ignore_extra_columns: false,
+            drop_columns: "ignore".into(),
+            recreate: false,
+            recreate_pragmatic: false,
+            import_mode: ImportMode::Balanced,
+            replace_existing: false,
+            skip_order_check: false,
+            auto: None,
+            jobs: 4,
+        }
+    }
+
     #[test]
     fn skips_covered_files_and_replaces_first_overlap_then_appends() {
-        for mode in ["balanced", "safe"] {
+        for mode in [ImportMode::Balanced, ImportMode::Safe] {
             let root = std::env::temp_dir().join(format!(
-                "csv-resume-{}-{}-{mode}",
+                "csv-resume-{}-{}-{mode:?}",
                 std::process::id(),
                 std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
@@ -1490,14 +1480,9 @@ mod tests {
             )
             .unwrap();
             fs::write(&next, "4,4,4,4,4,4,4,4,4,4,4,0\n").unwrap();
-            let args = Args::parse_from([
-                "csv-to-duckdb",
-                "--dir",
-                root.to_str().unwrap(),
-                "--ignore-extra-columns",
-                "--import-mode",
-                mode,
-            ]);
+            let mut args = test_args(&root);
+            args.ignore_extra_columns = true;
+            args.import_mode = mode;
             let job = ImportJob {
                 dir: root.clone(),
                 db_path: db.clone(),
@@ -1551,9 +1536,10 @@ mod tests {
 
     #[test]
     fn validates_column_selection() {
-        let args = Args::parse_from(["csv-to-duckdb", "--drop-columns", "ignore,volume"]);
+        let mut args = test_args(Path::new("."));
+        args.drop_columns = "ignore,volume".into();
         assert_eq!(dropped_columns(&args).unwrap(), vec![11, 5]);
-        let args = Args::parse_from(["csv-to-duckdb", "--drop-columns", "close"]);
+        args.drop_columns = "close".into();
         assert!(dropped_columns(&args).is_err());
     }
 
@@ -1573,13 +1559,8 @@ mod tests {
         let second = root.join("TEST-1s-2024-02.csv");
         fs::write(&first, "1,1,1,1,1,1,1,1,1,1,1,0\n").unwrap();
         fs::write(&second, "2,invalid\n").unwrap();
-        let args = Args::parse_from([
-            "csv-to-duckdb",
-            "--dir",
-            root.to_str().unwrap(),
-            "--report-file-progress",
-            "--ignore-extra-columns",
-        ]);
+        let mut args = test_args(&root);
+        args.ignore_extra_columns = true;
         let job = ImportJob {
             dir: root.clone(),
             db_path: db.clone(),
@@ -1631,12 +1612,8 @@ mod tests {
             "1,1,1,1,1,1,1,1,1,1,1,0,not-rsi\n2,2,2,2,2,2,2,2,2,2,2,0\n",
         )
         .unwrap();
-        let args = Args::parse_from([
-            "csv-to-duckdb",
-            "--dir",
-            root.to_str().unwrap(),
-            "--ignore-extra-columns",
-        ]);
+        let mut args = test_args(&root);
+        args.ignore_extra_columns = true;
         let job = ImportJob {
             dir: root.clone(),
             db_path: db.clone(),
@@ -1686,7 +1663,7 @@ mod tests {
             "1,9,9,9,9,9,1,9,9,9,9,0\n2,2,2,2,2,2,2,2,2,2,2,0\n3,9,9,9,9,9,3,9,9,9,9,0\n",
         )
         .unwrap();
-        let args = Args::parse_from(["csv-to-duckdb", "--dir", root.to_str().unwrap()]);
+        let args = test_args(&root);
         let job = || ImportJob {
             dir: root.clone(),
             db_path: db.clone(),

@@ -1,28 +1,28 @@
 # csv-to-duckdb
 
-Import one directory of Binance Vision kline CSVs into one DuckDB database. CSV files are selected by interval and processed in year-month order. `--jobs` controls how many files are inspected concurrently; database writes remain ordered.
+Library for importing one directory of Binance Vision kline CSVs into one DuckDB database.
 
-```sh
-cargo run --release -- --dir ../data/BTCUSDT --db ../db/BTCUSDT/BTCUSDT.duckdb --interval 1s --jobs 4
+## Use
+
+Add the crate to your Rust project:
+
+```toml
+csv-to-duckdb = "1.1.1"
 ```
 
-Files must be named `SYMBOL-INTERVAL-YYYY-MM.csv`, and the selected interval must contain only one symbol. Rows and files must be in strictly increasing timestamp order. The default table is `klines`, with `open_time` as its primary key. `--drop-columns` accepts a comma-separated list of Binance column names to omit; its default is `ignore` (the database column `ignore_col`). Pass `--drop-columns ''` to retain all columns. `open_time` and `close` are required for the pipeline.
+Import a folder with `ImportOptions`. The callback runs once for each file imported or skipped:
 
-On an existing database, the importer reads the last timestamp of each file and skips files ending at or before the database maximum. If the first remaining file starts at or before that maximum, it replaces its overlapping rows and inserts its new rows; later files are imported in order. This shortcut assumes ordered files and does not detect corrections or gaps in skipped history. Use `--replace-existing` to reimport all selected files. Replacement clears existing RSI values on affected rows when importing raw data; run `add-rsi` afterward.
-
-The selected dropped columns are also removed from existing tables. Restoring a previously removed column requires rebuilding the table from the retained CSVs. Only select columns you no longer need in the database.
-
-Use `--ignore-extra-columns` to ignore CSV fields beyond the 12 Binance columns, accepting mixed row widths. Use `--has-header` for headered CSVs and `--auto N` to select only the newest N files.
-
-`--report-file-progress` prints `@@CSV_FILE_IMPORTED@@` after each file is imported or skipped. `--import-mode safe`, `balanced`, and `unsafe` choose the write strategy; `balanced` is the default. Run `--help` for the remaining options. The old multi-folder and wide-database modes have been removed.
-
-## Rust library
-
-The crate exposes `import_folder` for applications that want to import one directory directly. It accepts an `ImportOptions` value and calls the supplied callback once for each CSV imported or skipped.
-
-## Checks
-
-```sh
-cargo fmt --check
-cargo test
+```rust,ignore
+let mut options = csv_to_duckdb::ImportOptions::new(
+    "data/BTCUSDT",
+    "db/BTCUSDT.duckdb",
+    "1s",
+);
+options.jobs = 4;
+options.ignore_extra_columns = true;
+csv_to_duckdb::import_folder(options, || {})?;
 ```
+
+Files must be named `SYMBOL-INTERVAL-YYYY-MM.csv`, contain one symbol and interval per folder, and be ordered by month. CSV rows must be ordered by `open_time`. The importer uses the `klines` table with `open_time` as its primary key. The `ignore` field maps to the database column `ignore_col`; `open_time` and `close` are required. Set `ignore_extra_columns` to discard fields beyond the 12 Binance columns.
+
+When updating an existing database, files ending at or before its maximum timestamp are skipped. The first remaining file replaces overlapping rows and inserts new ones; later files append. This assumes ordered files and does not detect corrections or gaps in skipped history. Selected dropped columns are also removed from the existing table; restoring them requires rebuilding from retained CSVs.

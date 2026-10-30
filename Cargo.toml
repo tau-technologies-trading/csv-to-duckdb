@@ -4,17 +4,15 @@ version = "1.1.1"
 edition = "2024"
 rust-version = "1.90"
 authors = ["Tau Technologies"]
-description = "CLI converting Binance Vision CSVs to a DuckDB .duckdb file"
+description = "Library for importing Binance Vision CSVs into DuckDB"
 readme = "README.md"
 repository = "https://github.com/tau-technologies-trading/csv-to-duckdb"
 homepage = "https://github.com/tau-technologies-trading/csv-to-duckdb"
 license = "MIT"
-keywords = ["duckdb", "binance", "csv", "trading", "cli"]
-categories = ["command-line-utilities"]
+keywords = ["duckdb", "binance", "csv", "trading"]
 
 [dependencies]
 anyhow = "1.0.102"
-clap = { version = "4.6.1", features = ["derive"] }
 csv = "1.4.0"
 indicatif = "0.18"
 
